@@ -389,6 +389,9 @@ static void cmd_send_now(void);
 // CAN inter-module
 static void can_process_intermod(const twai_message_t *msg);
 
+// Safety state (declared early -- used by CAN driver emergency stop)
+static SafetyState_t safety_state = SAFETY_STATE_INIT;
+
 // =============================================================================
 //  CHARGER COMMAND STATE (used by OLED display + serial command handler)
 // =============================================================================
@@ -492,8 +495,8 @@ static uint16_t outlet_max_watts(void) {
         case OUTLET_110_30A:     return 3300;
         case OUTLET_220_15A:     return 3300;
         case OUTLET_220_30A:     return 6600;
-        case OUTLET_EV_STATION:  return (uint16_t)(220 * outlet_amps_ac);
-        case OUTLET_USER_DEFINED: return (uint16_t)(outlet_voltage_ac * outlet_amps_ac);
+        case OUTLET_EV_STATION:  return (uint16_t)((uint32_t)220 * outlet_amps_ac);
+        case OUTLET_USER_DEFINED: return (uint16_t)((uint32_t)outlet_voltage_ac * outlet_amps_ac);
         case OUTLET_TEST_DEV:    return 0;  // 0 = no limit
         default:                 return 1650;
     }
@@ -1215,8 +1218,8 @@ static bool     btn_hold_active_flag = false;
 static void update_btn(Button_t *b) {
     bool raw = (bool)digitalRead(b->pin);
     if (raw == b->last_raw) return;
-    b->last_raw = raw;
     if ((millis() - b->last_change_ms) < BTN_DEBOUNCE_MS) return;
+    b->last_raw = raw;
     b->last_change_ms = millis();
     bool pressed = !raw;
     if (pressed && !b->state) b->event = true;
@@ -1446,8 +1449,6 @@ bool gps_driver_get(GPSData_t *out) {
 //  STATE TRACKER (display-only, never sends CAN -- serial commands own the bus)
 // =============================================================================
 
-static SafetyState_t safety_state = SAFETY_STATE_INIT;
-
 const char *safety_state_name(SafetyState_t s) {
     switch (s) {
         case SAFETY_STATE_INIT:         return "INIT";
@@ -1550,7 +1551,7 @@ void ble_server_init(void) {
     ble_server_ptr = BLEDevice::createServer();
     ble_server_ptr->setCallbacks(new ServerCB());
 
-    BLEService *svc = ble_server_ptr->createService(SVC_UUID);
+    BLEService *svc = ble_server_ptr->createService(BLEUUID(SVC_UUID), 40);
 
     ble_ch_state = svc->createCharacteristic(CHAR_SAFETY_STATE_UUID,
                      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
@@ -1600,6 +1601,7 @@ void ble_server_init(void) {
 }
 
 void ble_server_update(void) {
+    if (!ble_ch_state || !ble_ch_temp || !ble_ch_cur) return;  // BLE init incomplete
     uint32_t now = millis();
     if (now - ble_last_notify_ms < BLE_NOTIFY_INTERVAL_MS) return;
     ble_last_notify_ms = now;
@@ -1729,26 +1731,8 @@ static bool     oled_held         = false;
 
 // ---- helpers ----------------------------------------------------------------
 
-static const char *oled_state_label(SafetyState_t s) {
-    switch (s) {
-        case SAFETY_STATE_INIT:         return "INIT";
-        case SAFETY_STATE_UNPLUGGED:    return "UNPLUGGED";
-        case SAFETY_STATE_IDLE:         return "READY";
-        case SAFETY_STATE_CHARGING:     return "CHARGING";
-        case SAFETY_STATE_COMPLETE:     return "COMPLETE";
-        case SAFETY_STATE_MAINTAINING:  return "MAINTAIN";
-        case SAFETY_STATE_SCHEDULED:    return "SCHEDULED";
-        case SAFETY_STATE_OVERTEMP:     return "OVER TEMP";
-        case SAFETY_STATE_UNDERTEMP:    return "UNDER TEMP";
-        case SAFETY_STATE_BMS_FAULT:    return "BMS FAULT";
-        case SAFETY_STATE_COMM_TIMEOUT: return "COMM TMO";
-        case SAFETY_STATE_FAULT:        return "FAULT";
-        default:                        return "UNKNOWN";
-    }
-}
-
 static void draw_header(SafetyState_t state, const char *page_title) {
-    const char *label = oled_state_label(state);
+    const char *label = safety_state_name(state);
 
     u8g2.setFont(u8g2_font_7x13B_tr);
     int16_t  lw    = u8g2.getStrWidth(label);
@@ -2789,19 +2773,44 @@ static void cmd_process_char(char c) {
         if (cmd_buf_active) {
             if (c == '\r' || c == '\n' || c == ';') {
                 cmd_buf[cmd_buf_len] = '\0';
-                if (cmd_buf_len > 0) cmd_execute_multi(cmd_buf, cmd_buf_len);
-                cmd_buf_len = 0;
-                cmd_buf_active = false;
+                if (cmd_buf_len == 1) {
+                    // Single char was buffered (e.g. just 'T' + Enter)
+                    // Process as single-char command via the switch below
+                    cmd_buf_active = false;
+                    c = cmd_buf[0];
+                    cmd_buf_len = 0;
+                    // fall through to switch statement
+                } else if (cmd_buf_len > 0) {
+                    cmd_execute_multi(cmd_buf, cmd_buf_len);
+                    cmd_buf_len = 0;
+                    cmd_buf_active = false;
+                    return;
+                } else {
+                    cmd_buf_active = false;
+                    return;
+                }
+            } else {
+                if (cmd_buf_len < CMD_BUF_SIZE - 1) {
+                    cmd_buf[cmd_buf_len++] = c;
+                }
                 return;
             }
-            if (cmd_buf_len < CMD_BUF_SIZE - 1) {
-                cmd_buf[cmd_buf_len++] = c;
-            }
-            return;
         }
 
         // Check if this char starts a multi-char command
+        // O = outlet presets, T = thermal/sensor/cal (TZ, TS, TC)
+        // Note: single 't' for schedule toggle is handled in the switch below
+        // Multi-char T commands require a second char (Z, S, or C) before Enter
         if (c == 'O') {
+            cmd_buf_active = true;
+            cmd_buf_len = 0;
+            cmd_buf[cmd_buf_len++] = c;
+            return;
+        }
+        if (c == 'T') {
+            // Could be single 't' for schedule or multi-char TZ/TS/TC
+            // Buffer it -- if next char is Z/S/C, continue buffering
+            // If next char is Enter/other, process 't' as schedule toggle
             cmd_buf_active = true;
             cmd_buf_len = 0;
             cmd_buf[cmd_buf_len++] = c;
@@ -2818,12 +2827,6 @@ static void cmd_process_char(char c) {
                 if (!cmd_buddy_mode) {
                     // New session if not already running
                     if (nrg_session_start == 0) {
-                        // Save current as previous before starting new
-                        if (nrg_session_wh > 0.1f) {
-                            nrg_prev_wh = nrg_session_wh;
-                            nrg_prev_ah = nrg_session_ah;
-                            nrg_prev_duration_s = (millis() - nrg_session_start) / 1000;
-                        }
                         nrg_session_wh = 0.0f;
                         nrg_session_ah = 0.0f;
                         nrg_session_start = millis();
@@ -3098,9 +3101,6 @@ static void cmd_process_char(char c) {
 
 
 // =============================================================================
-//  BLE COMMAND CHARACTERISTIC
-// =============================================================================
-
 // =============================================================================
 //  WIFI SERVER (fallback when BLE signal is weak)
 // =============================================================================
@@ -3301,7 +3301,9 @@ static void can_process_intermod(const twai_message_t *msg) {
 
         case INTERMOD_CMD_SET_AMPS:
             if (msg->data_length_code >= 3) {
-                cmd_current_da = ((uint16_t)msg->data[1] << 8) | msg->data[2];
+                uint16_t req_da = ((uint16_t)msg->data[1] << 8) | msg->data[2];
+                if (req_da > CHARGER_CURRENT_MAX_DA) req_da = CHARGER_CURRENT_MAX_DA;
+                cmd_current_da = req_da;
                 cmd_send_now();
                 Serial.printf("[CAN] Current set to %.1fA from external module\n",
                               cmd_current_da * 0.1f);
@@ -3310,7 +3312,10 @@ static void can_process_intermod(const twai_message_t *msg) {
 
         case INTERMOD_CMD_SET_VOLTS:
             if (msg->data_length_code >= 3) {
-                cmd_voltage_dv = ((uint16_t)msg->data[1] << 8) | msg->data[2];
+                uint16_t req_dv = ((uint16_t)msg->data[1] << 8) | msg->data[2];
+                if (req_dv > CHARGER_VOLTAGE_MAX_DV) req_dv = CHARGER_VOLTAGE_MAX_DV;
+                if (req_dv < CHARGER_VOLTAGE_MIN_DV) req_dv = CHARGER_VOLTAGE_MIN_DV;
+                cmd_voltage_dv = req_dv;
                 cmd_send_now();
                 Serial.printf("[CAN] Voltage set to %.1fV from external module\n",
                               cmd_voltage_dv * 0.1f);
