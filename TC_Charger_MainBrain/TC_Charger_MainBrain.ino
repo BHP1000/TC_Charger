@@ -681,7 +681,6 @@ static bool twai_send_frame(const ChargerCmd_t *cmd) {
 
     esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(10));
     if (err != ESP_OK) {
-        Serial.printf("[CAN] TX error: %d\n", err);
         return false;
     }
     can_last_tx_ms = millis();
@@ -2371,6 +2370,10 @@ static void cmd_print_help(void) {
     Serial.println("  TSB1,0  - Disable BMS Temp1 (TSB1,TSB2)");
     Serial.println("  TC1,-2.0 - Calibrate NTC T1 offset (F)");
     Serial.println("  TCB1,1.5 - Calibrate BMS Temp1 offset (F)");
+    Serial.println("  NLW,500  - Set lifetime Wh (after flash erase)");
+    Serial.println("  NLA,6.5  - Set lifetime Ah");
+    Serial.println("  NE,32.0  - Set efficiency (Wh/mile)");
+    Serial.println("  ND       - Dump all NVS values (backup)");
     Serial.println("========================================");
     Serial.println();
 }
@@ -2763,6 +2766,67 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
         return;
     }
 
+    // NVS commands: NLW,1234.5 (lifetime Wh), NLA,56.7 (lifetime Ah),
+    //   NE,32.0 (efficiency Wh/mi), ND (dump all NVS values)
+    if (buf[0] == 'N' && len >= 2) {
+        if (buf[1] == 'D') {
+            // Dump all NVS values
+            Serial.println();
+            Serial.println("========= NVS Stored Values =========");
+            Serial.printf("  Lifetime Wh:  %.1f  (restore: NLW,%.1f)\n", nrg_lifetime_wh, nrg_lifetime_wh);
+            Serial.printf("  Lifetime Ah:  %.1f  (restore: NLA,%.1f)\n", nrg_lifetime_ah, nrg_lifetime_ah);
+            Serial.printf("  Wh/mile:      %.1f  (restore: NE,%.1f)\n", range_wh_per_mile, range_wh_per_mile);
+            Serial.printf("  Outlet:       %s   (restore: O%c)\n", outlet_name(),
+                          outlet_preset <= OUTLET_220_30A ? ('A' + outlet_preset) : 'A');
+            if (outlet_preset == OUTLET_USER_DEFINED)
+                Serial.printf("  User outlet:  %uV/%uA  (restore: OU%u,%u)\n",
+                              outlet_voltage_ac, outlet_amps_ac, outlet_voltage_ac, outlet_amps_ac);
+            if (outlet_preset == OUTLET_EV_STATION)
+                Serial.printf("  EV Station:   %uA  (restore: OG%u)\n", outlet_amps_ac, outlet_amps_ac);
+            Serial.printf("  Thermal Z1:   %.0fF  (restore: TZ1,%.0f)\n", tz_normal_max_f, tz_normal_max_f);
+            Serial.printf("  Thermal Z2:   %.0fF  (restore: TZ2,%.0f)\n", tz_caution_max_f, tz_caution_max_f);
+            Serial.printf("  Thermal Z3:   %.0fF  (restore: TZ3,%.0f)\n", tz_danger_max_f, tz_danger_max_f);
+            for (int i = 1; i <= 5; i++) {
+                if (sensor_ntc_offset_f[i] != 0.0f)
+                    Serial.printf("  NTC T%d cal:   %+.1fF  (restore: TC%d,%.1f)\n",
+                                  i, sensor_ntc_offset_f[i], i, sensor_ntc_offset_f[i]);
+            }
+            if (sensor_bms1_offset_f != 0.0f)
+                Serial.printf("  BMS T1 cal:   %+.1fF  (restore: TCB1,%.1f)\n",
+                              sensor_bms1_offset_f, sensor_bms1_offset_f);
+            if (sensor_bms2_offset_f != 0.0f)
+                Serial.printf("  BMS T2 cal:   %+.1fF  (restore: TCB2,%.1f)\n",
+                              sensor_bms2_offset_f, sensor_bms2_offset_f);
+            Serial.println("=====================================");
+            Serial.println();
+            return;
+        }
+
+        const char *comma = strchr(&buf[1], ',');
+        if (comma) {
+            float val = atof(comma + 1);
+
+            if (buf[1] == 'L' && buf[2] == 'W') {
+                nrg_lifetime_wh = val;
+                nrg_prefs.putFloat("lifetime_wh", nrg_lifetime_wh);
+                Serial.printf("[NVS] Lifetime Wh set to %.1f\n", nrg_lifetime_wh);
+                return;
+            }
+            if (buf[1] == 'L' && buf[2] == 'A') {
+                nrg_lifetime_ah = val;
+                nrg_prefs.putFloat("lifetime_ah", nrg_lifetime_ah);
+                Serial.printf("[NVS] Lifetime Ah set to %.1f\n", nrg_lifetime_ah);
+                return;
+            }
+            if (buf[1] == 'E') {
+                range_wh_per_mile = val;
+                nrg_prefs.putFloat("wh_per_mile", range_wh_per_mile);
+                Serial.printf("[NVS] Efficiency set to %.1f Wh/mile\n", range_wh_per_mile);
+                return;
+            }
+        }
+    }
+
     Serial.printf("[CMD] Unknown multi-char: %s\n", buf);
 }
 
@@ -2801,7 +2865,7 @@ static void cmd_process_char(char c) {
         // O = outlet presets, T = thermal/sensor/cal (TZ, TS, TC)
         // Note: single 't' for schedule toggle is handled in the switch below
         // Multi-char T commands require a second char (Z, S, or C) before Enter
-        if (c == 'O') {
+        if (c == 'O' || c == 'N') {
             cmd_buf_active = true;
             cmd_buf_len = 0;
             cmd_buf[cmd_buf_len++] = c;
@@ -3223,7 +3287,7 @@ static void wifi_handle_cmd(void) {
             }
 
             // Outlet, ThermalZone, TempSensor, TempCal
-            if (first == 'O' ||
+            if (first == 'O' || first == 'N' ||
                 (first == 'T' && cmd.length() >= 3 &&
                  (cmd.charAt(1) == 'Z' || cmd.charAt(1) == 'S' || cmd.charAt(1) == 'C'))) {
                 char buf[CMD_BUF_SIZE];
