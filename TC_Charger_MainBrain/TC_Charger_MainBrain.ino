@@ -611,6 +611,63 @@ static uint8_t  time_hour            = 0;
 static uint8_t  time_minute          = 0;
 static uint32_t time_update_ms       = 0;
 
+// ---- Electricity cost tracking ----
+static float cost_per_kwh       = 0.12f;   // default $0.12/kWh (home)
+static float cost_session       = 0.0f;    // current session cost
+static float cost_lifetime      = 0.0f;    // lifetime cost (NVS)
+static float cost_free_lifetime = 0.0f;    // energy from free chargers (NVS)
+
+// Per-outlet cost rates ($/kWh). Free = 0, home default, station rates.
+static float outlet_cost_rate(void) {
+    switch (outlet_preset) {
+        case OUTLET_EV_STATION: return 0.0f;  // assume free public station by default
+        case OUTLET_TEST_DEV:   return 0.0f;
+        default:                return cost_per_kwh;
+    }
+}
+
+// ---- Charge completion notification ----
+#define BUZZER_PIN          -1     // set to GPIO number if buzzer wired, -1 = none
+#define BLE_NOTIFY_COMPLETE  1     // always enabled
+static bool notify_sent       = false;  // prevent repeat notifications
+
+// ---- Thermal prediction ----
+// Track rate of temperature rise to predict when derating will start
+static float thermal_rise_rate_f_per_min = 0.0f;   // learned F/minute at current amps
+static float thermal_last_temp_f         = -999.0f;
+static uint32_t thermal_predict_ms       = 0;
+#define THERMAL_PREDICT_INTERVAL_MS  60000UL  // sample temp every 60 seconds
+
+static float thermal_time_to_caution_min(void) {
+    // Estimate minutes until CAUTION zone at current rise rate
+    float max_f = get_max_battery_temp_f();
+    if (max_f < -900.0f || thermal_rise_rate_f_per_min <= 0.01f) return -1.0f;
+    float degrees_left = tz_normal_max_f - max_f;
+    if (degrees_left <= 0.0f) return 0.0f;
+    return degrees_left / thermal_rise_rate_f_per_min;
+}
+
+// ---- GPS source selection ----
+typedef enum {
+    GPS_SOURCE_ONBOARD = 0,   // HGLRC M100 on UART2
+    GPS_SOURCE_PHONE,         // received via BLE/WiFi from app
+    GPS_SOURCE_BOTH,          // fused: phone primary, onboard fallback
+} GPSSource_t;
+
+static GPSSource_t gps_source = GPS_SOURCE_BOTH;  // default: use both
+
+// Phone GPS data (received from app)
+static float phone_gps_lat    = 0.0f;
+static float phone_gps_lon    = 0.0f;
+static float phone_gps_speed  = 0.0f;  // mph
+static bool  phone_gps_valid  = false;
+static uint32_t phone_gps_ms  = 0;
+#define PHONE_GPS_TIMEOUT_MS  5000UL
+
+// ---- Session summary for app logging (BLE characteristic) ----
+// Packed into existing charger telemetry + new session end characteristic
+#define CHAR_SESSION_END_UUID "beb5483e-36e1-4688-b7f5-ea07361b26b2"
+
 // ---- Multi-char command buffer ----
 #define CMD_BUF_SIZE 32
 static char  cmd_buf[CMD_BUF_SIZE];
@@ -745,6 +802,13 @@ static void parse_rx_frame(const twai_message_t *msg) {
             nrg_session_ah  += dAh;
             nrg_lifetime_wh += dWh;
             nrg_lifetime_ah += dAh;
+            // Cost tracking
+            float dCost = dWh * outlet_cost_rate() / 1000.0f;  // $/Wh to $/kWh
+            cost_session += dCost;
+            if (outlet_cost_rate() > 0.001f)
+                cost_lifetime += dCost;
+            else
+                cost_free_lifetime += dWh / 1000.0f;  // track free kWh
         }
         nrg_last_ms = now;
     } else {
@@ -1511,6 +1575,7 @@ static BLECharacteristic   *ble_ch_bms_cells   = nullptr;
 static BLECharacteristic   *ble_ch_gps         = nullptr;
 static BLECharacteristic   *ble_ch_cmd         = nullptr;
 static BLECharacteristic   *ble_ch_charger     = nullptr;
+static BLECharacteristic   *ble_ch_session_end = nullptr;
 static bool                 ble_connected  = false;
 static uint16_t             ble_pack_voltage_dv = 840;
 static uint32_t             ble_last_notify_ms  = 0;
@@ -1550,7 +1615,7 @@ void ble_server_init(void) {
     ble_server_ptr = BLEDevice::createServer();
     ble_server_ptr->setCallbacks(new ServerCB());
 
-    BLEService *svc = ble_server_ptr->createService(BLEUUID(SVC_UUID), 40);
+    BLEService *svc = ble_server_ptr->createService(BLEUUID(SVC_UUID), 48);
 
     ble_ch_state = svc->createCharacteristic(CHAR_SAFETY_STATE_UUID,
                      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
@@ -1590,6 +1655,11 @@ void ble_server_init(void) {
     // [14-17] power_w (float)  [18-21] miles_added (float)
     ble_ch_charger = svc->createCharacteristic(CHAR_CHARGER_UUID,
                          BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+
+    // Session end summary -- notified once when charge stops
+    // App reads this to log session: start_v(2) end_v(2) wh(4) ah(4) duration_s(4) profile(1) outlet(1) cost(4) = 22 bytes
+    ble_ch_session_end = svc->createCharacteristic(CHAR_SESSION_END_UUID,
+                             BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
 
     svc->start();
     BLEAdvertising *adv = BLEDevice::getAdvertising();
@@ -1711,6 +1781,37 @@ void ble_server_update(void) {
 
 bool     ble_server_is_connected(void)        { return ble_connected; }
 uint16_t ble_server_get_pack_voltage_dv(void) { return ble_pack_voltage_dv; }
+
+// Send session end summary via BLE + buzzer alert
+static void notify_charge_complete(float start_v, float end_v, float wh, float ah,
+                                    uint32_t duration_s, uint8_t profile, uint8_t outlet, float cost) {
+    // BLE session end packet (22 bytes)
+    if (ble_ch_session_end) {
+        uint8_t b[22];
+        uint16_t sv = (uint16_t)(start_v * 10.0f);
+        uint16_t ev = (uint16_t)(end_v * 10.0f);
+        b[0] = sv & 0xFF; b[1] = (sv >> 8) & 0xFF;
+        b[2] = ev & 0xFF; b[3] = (ev >> 8) & 0xFF;
+        memcpy(&b[4], &wh, 4);
+        memcpy(&b[8], &ah, 4);
+        memcpy(&b[12], &duration_s, 4);
+        b[16] = profile;
+        b[17] = outlet;
+        memcpy(&b[18], &cost, 4);
+        ble_ch_session_end->setValue(b, sizeof(b));
+        if (ble_connected) ble_ch_session_end->notify();
+    }
+
+    // Buzzer (if wired)
+    if (BUZZER_PIN >= 0) {
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(BUZZER_PIN, HIGH);
+            delay(200);
+            digitalWrite(BUZZER_PIN, LOW);
+            delay(200);
+        }
+    }
+}
 
 // =============================================================================
 //  OLED DISPLAY
@@ -2198,8 +2299,21 @@ void safety_sm_update(void) {
                 maintain_check_ms = now;
                 Serial.println("[MAINTAIN] Entering maintenance mode -- monitoring voltage");
             }
+
+            // Charge completion notification
+            if (!notify_sent) {
+                notify_sent = true;
+                float sess_wh = cmd_buddy_mode ? nrg_buddy_wh : nrg_session_wh;
+                float sess_ah = cmd_buddy_mode ? nrg_buddy_ah : nrg_session_ah;
+                uint32_t dur = nrg_session_start ? (now - nrg_session_start) / 1000 : 0;
+                float sess_cost = cost_session;
+                notify_charge_complete(0, can_smooth_voltage, sess_wh, sess_ah,
+                                        dur, (uint8_t)cmd_profile, (uint8_t)outlet_preset, sess_cost);
+                Serial.printf("[NOTIFY] Charge complete -- $%.2f this session\n", sess_cost);
+            }
         } else {
             safety_state = SAFETY_STATE_CHARGING;
+            notify_sent = false;  // reset for next completion
 
             // Thermal zone enforcement (skipped in TEST/DEV)
             float max_batt_f = get_max_battery_temp_f();
@@ -2232,6 +2346,23 @@ void safety_sm_update(void) {
                     cmd.control    = CAN_CTRL_CHARGE;
                     cmd.mode       = CAN_MODE_CHARGE;
                     can_send_command(&cmd);
+                }
+
+                // Thermal prediction: track rate of temperature rise
+                if ((now - thermal_predict_ms) >= THERMAL_PREDICT_INTERVAL_MS) {
+                    thermal_predict_ms = now;
+                    if (max_batt_f > -900.0f) {
+                        if (thermal_last_temp_f > -900.0f) {
+                            float delta_f = max_batt_f - thermal_last_temp_f;
+                            if (delta_f > 0.0f) {
+                                if (thermal_rise_rate_f_per_min < 0.01f)
+                                    thermal_rise_rate_f_per_min = delta_f;
+                                else
+                                    thermal_rise_rate_f_per_min += 0.2f * (delta_f - thermal_rise_rate_f_per_min);
+                            }
+                        }
+                        thermal_last_temp_f = max_batt_f;
+                    }
                 }
             }
         }
@@ -2373,7 +2504,10 @@ static void cmd_print_help(void) {
     Serial.println("  NLW,500  - Set lifetime Wh (after flash erase)");
     Serial.println("  NLA,6.5  - Set lifetime Ah");
     Serial.println("  NE,32.0  - Set efficiency (Wh/mile)");
+    Serial.println("  NC,0.12  - Set electricity cost ($/kWh)");
+    Serial.println("  NF,42.30 - Set lifetime cost ($)");
     Serial.println("  ND       - Dump all NVS values (backup)");
+    Serial.println("  GA/GP/GB - GPS: onboard/phone/both");
     Serial.println("========================================");
     Serial.println();
 }
@@ -2510,6 +2644,36 @@ static void cmd_print_status(void) {
         Serial.println("  Start charging to see time-to-range estimates");
     }
 
+    // Time to target profiles
+    if (can_smooth_current > 0.5f) {
+        float avg_power_w = can_smooth_voltage * can_smooth_current;
+        Serial.println("  ---- Time to Target ----");
+        for (int pr = PROFILE_STORAGE; pr <= PROFILE_100; pr++) {
+            float target_v = (float)((uint32_t)profile_cell_mv[pr] * HOME_CELLS) / 1000.0f;
+            if (can_smooth_voltage < target_v) {
+                float wh_est = (target_v - can_smooth_voltage) * can_smooth_current * 0.5f;
+                int mins = (int)(wh_est / avg_power_w * 60.0f);
+                Serial.printf("  %s (%.1fV): ~%d min\n", profile_name((ChargeProfile_t)pr), target_v, mins);
+            } else {
+                Serial.printf("  %s (%.1fV): already reached\n", profile_name((ChargeProfile_t)pr), target_v);
+            }
+        }
+    }
+
+    // Cost
+    Serial.println("  ---- Cost ----");
+    Serial.printf("  Rate:     $%.3f/kWh (%s)\n", outlet_cost_rate(), outlet_name());
+    if (cost_session > 0.001f)
+        Serial.printf("  Session:  $%.2f\n", cost_session);
+    Serial.printf("  Lifetime: $%.2f (paid) + %.1f kWh free\n", cost_lifetime, cost_free_lifetime);
+
+    // Thermal prediction
+    float ttc = thermal_time_to_caution_min();
+    if (ttc > 0.0f && cmd_charging) {
+        Serial.printf("  Thermal:  ~%.0f min to CAUTION at current rate (%.1fF/min rise)\n",
+                      ttc, thermal_rise_rate_f_per_min);
+    }
+
     // Maintain & Schedule
     Serial.println("  ---- Modes ----");
     Serial.printf("  Maintain:  %s", maintain_enabled ? "ON" : "OFF");
@@ -2577,6 +2741,8 @@ static void serial_command_update(void) {
         nrg_save_ms = now;
         nrg_prefs.putFloat("lifetime_wh", nrg_lifetime_wh);
         nrg_prefs.putFloat("lifetime_ah", nrg_lifetime_ah);
+        nrg_prefs.putFloat("cost_life", cost_lifetime);
+        nrg_prefs.putFloat("cost_free", cost_free_lifetime);
     }
 
     // ---- Periodic status line (every 5s) ----
@@ -2618,12 +2784,13 @@ static void serial_command_update(void) {
             Serial.print("Chgr: NO RESPONSE");
         }
 
-        // Energy + range
+        // Energy + range + cost
         if (cmd_buddy_mode && nrg_buddy_wh > 0.1f) {
             Serial.printf(" | Buddy:%.1fWh", nrg_buddy_wh);
         } else if (nrg_session_wh > 0.1f) {
             float miles = nrg_session_wh / range_wh_per_mile;
             Serial.printf(" | %.1fWh +%.1fmi", nrg_session_wh, miles);
+            if (cost_session > 0.001f) Serial.printf(" $%.2f", cost_session);
         }
         Serial.println();
     }
@@ -2766,8 +2933,42 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
         return;
     }
 
+    // GPS source: GA (onboard), GP (phone), GB (both)
+    if (buf[0] == 'G' && len >= 2) {
+        switch (buf[1]) {
+            case 'A': gps_source = GPS_SOURCE_ONBOARD;
+                Serial.println("[GPS] Source: ONBOARD only"); break;
+            case 'P': gps_source = GPS_SOURCE_PHONE;
+                Serial.println("[GPS] Source: PHONE only"); break;
+            case 'B': gps_source = GPS_SOURCE_BOTH;
+                Serial.println("[GPS] Source: BOTH (phone primary, onboard fallback)"); break;
+            default: Serial.println("[CMD] GPS: GA=onboard, GP=phone, GB=both"); break;
+        }
+        return;
+    }
+
+    // Phone GPS data: PG,lat,lon,speed_mph (from app)
+    if (buf[0] == 'P' && buf[1] == 'G' && len >= 5) {
+        // Parse: PG,26.12345,-80.54321,42.5
+        const char *p = &buf[3];
+        const char *c1 = strchr(p, ',');
+        if (c1) {
+            phone_gps_lat = atof(p);
+            const char *c2 = strchr(c1 + 1, ',');
+            if (c2) {
+                phone_gps_lon = atof(c1 + 1);
+                phone_gps_speed = atof(c2 + 1);
+            } else {
+                phone_gps_lon = atof(c1 + 1);
+            }
+            phone_gps_valid = true;
+            phone_gps_ms = millis();
+        }
+        return;
+    }
+
     // NVS commands: NLW,1234.5 (lifetime Wh), NLA,56.7 (lifetime Ah),
-    //   NE,32.0 (efficiency Wh/mi), ND (dump all NVS values)
+    //   NE,32.0 (efficiency Wh/mi), NC,0.12 (cost/kWh), ND (dump all)
     if (buf[0] == 'N' && len >= 2) {
         if (buf[1] == 'D') {
             // Dump all NVS values
@@ -2797,6 +2998,14 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
             if (sensor_bms2_offset_f != 0.0f)
                 Serial.printf("  BMS T2 cal:   %+.1fF  (restore: TCB2,%.1f)\n",
                               sensor_bms2_offset_f, sensor_bms2_offset_f);
+            Serial.printf("  Cost/kWh:     $%.3f  (restore: NC,%.3f)\n", cost_per_kwh, cost_per_kwh);
+            Serial.printf("  Cost lifetime: $%.2f  (restore: NF,%.2f)\n", cost_lifetime, cost_lifetime);
+            Serial.printf("  Free energy:  %.1f kWh\n", cost_free_lifetime);
+            Serial.printf("  GPS source:   %s  (restore: G%c)\n",
+                          gps_source == GPS_SOURCE_ONBOARD ? "ONBOARD" :
+                          gps_source == GPS_SOURCE_PHONE ? "PHONE" : "BOTH",
+                          gps_source == GPS_SOURCE_ONBOARD ? 'A' :
+                          gps_source == GPS_SOURCE_PHONE ? 'P' : 'B');
             Serial.println("=====================================");
             Serial.println();
             return;
@@ -2822,6 +3031,18 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
                 range_wh_per_mile = val;
                 nrg_prefs.putFloat("wh_per_mile", range_wh_per_mile);
                 Serial.printf("[NVS] Efficiency set to %.1f Wh/mile\n", range_wh_per_mile);
+                return;
+            }
+            if (buf[1] == 'C') {
+                cost_per_kwh = val;
+                nrg_prefs.putFloat("cost_kwh", cost_per_kwh);
+                Serial.printf("[NVS] Cost set to $%.3f/kWh\n", cost_per_kwh);
+                return;
+            }
+            if (buf[1] == 'F') {
+                cost_lifetime = val;
+                nrg_prefs.putFloat("cost_life", cost_lifetime);
+                Serial.printf("[NVS] Lifetime cost set to $%.2f\n", cost_lifetime);
                 return;
             }
         }
@@ -2865,7 +3086,7 @@ static void cmd_process_char(char c) {
         // O = outlet presets, T = thermal/sensor/cal (TZ, TS, TC)
         // Note: single 't' for schedule toggle is handled in the switch below
         // Multi-char T commands require a second char (Z, S, or C) before Enter
-        if (c == 'O' || c == 'N') {
+        if (c == 'O' || c == 'N' || c == 'G' || c == 'P') {
             cmd_buf_active = true;
             cmd_buf_len = 0;
             cmd_buf[cmd_buf_len++] = c;
@@ -3219,7 +3440,15 @@ static String wifi_build_status_json(void) {
     json += "\"time_valid\":" + String(time_valid ? "true" : "false") + ",";
     json += "\"time\":\"" + String(time_hour) + ":" +
             (time_minute < 10 ? "0" : "") + String(time_minute) + "\",";
-    json += "\"state\":\"" + String(safety_state_name(safety_state)) + "\"";
+    json += "\"state\":\"" + String(safety_state_name(safety_state)) + "\",";
+    json += "\"cost_kwh\":" + String(cost_per_kwh, 3) + ",";
+    json += "\"cost_session\":" + String(cost_session, 2) + ",";
+    json += "\"cost_lifetime\":" + String(cost_lifetime, 2) + ",";
+    json += "\"cost_free_kwh\":" + String(cost_free_lifetime, 1) + ",";
+    json += "\"gps_source\":\"" + String(gps_source == GPS_SOURCE_ONBOARD ? "ONBOARD" :
+                                         gps_source == GPS_SOURCE_PHONE ? "PHONE" : "BOTH") + "\",";
+    float ttc = thermal_time_to_caution_min();
+    json += "\"thermal_mins_to_caution\":" + String(ttc > 0 ? ttc : -1.0f, 0);
     json += "}";
     return json;
 }
@@ -3287,7 +3516,7 @@ static void wifi_handle_cmd(void) {
             }
 
             // Outlet, ThermalZone, TempSensor, TempCal
-            if (first == 'O' || first == 'N' ||
+            if (first == 'O' || first == 'N' || first == 'G' || first == 'P' ||
                 (first == 'T' && cmd.length() >= 3 &&
                  (cmd.charAt(1) == 'Z' || cmd.charAt(1) == 'S' || cmd.charAt(1) == 'C'))) {
                 char buf[CMD_BUF_SIZE];
@@ -3480,6 +3709,11 @@ void setup() {
     sensor_bms1_offset_f = nrg_prefs.getFloat("calb1", 0.0f);
     sensor_bms2_offset_f = nrg_prefs.getFloat("calb2", 0.0f);
 
+    // Load cost tracking
+    cost_per_kwh = nrg_prefs.getFloat("cost_kwh", 0.12f);
+    cost_lifetime = nrg_prefs.getFloat("cost_life", 0.0f);
+    cost_free_lifetime = nrg_prefs.getFloat("cost_free", 0.0f);
+
     Serial.printf("[NVS] Lifetime: %.1fWh / %.1fAh  Efficiency: %.1f Wh/mi\n",
                   nrg_lifetime_wh, nrg_lifetime_ah, range_wh_per_mile);
     Serial.printf("[NVS] Outlet: %s (max %uW)%s\n",
@@ -3487,6 +3721,12 @@ void setup() {
                   test_dev_mode ? " [DEV MODE]" : "");
     Serial.printf("[NVS] Thermal zones: NORMAL<%.0fF CAUTION<%.0fF DANGER<%.0fF\n",
                   tz_normal_max_f, tz_caution_max_f, tz_danger_max_f);
+
+    // Buzzer pin (if wired)
+    if (BUZZER_PIN >= 0) {
+        pinMode(BUZZER_PIN, OUTPUT);
+        digitalWrite(BUZZER_PIN, LOW);
+    }
 
     // Start with charger disabled
     can_send_disable();
