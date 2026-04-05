@@ -18,10 +18,11 @@ All contributions must be open source. If you want commercial rights, contact th
 | Item | Detail |
 |------|--------|
 | Model | HK-LF-115-58 |
+| Configuration | 9000/HD623 |
 | Manufacturer | TC Charger Standard |
 | Power | 6.6 kW |
 | Output | 20V - 108V, up to 60A |
-| Control | CAN bus 250 kbps, extended 29-bit frames |
+| CAN bus | 250 kbps, CAN 2.0B extended 29-bit frames (SAE J1939 style addressing) |
 | Charging method | Pulse charging (CC-CV with pulsed current delivery) |
 
 ### Controller (Main Brain)
