@@ -65,6 +65,9 @@
 #define INTERMOD_CMD_SET_VOLTS   0x04  // Byte 1-2: voltage_dv big-endian
 #define INTERMOD_CMD_SET_PROFILE 0x05  // Byte 1: profile enum
 
+// TPMS data from VESC module (CAN broadcast)
+#define CAN_TPMS_DATA_ID         0x1C000010UL  // VESC -> all: tire pressure/temp
+
 // ---- RS485 ----
 #define RS485_BAUD           115200
 #define RS485_TIMEOUT_MS     50
@@ -627,8 +630,7 @@ static float outlet_cost_rate(void) {
 }
 
 // ---- Charge completion notification ----
-#define BUZZER_PIN          -1     // set to GPIO number if buzzer wired, -1 = none
-#define BLE_NOTIFY_COMPLETE  1     // always enabled
+// BLE notification + RGB LED flash (no buzzer)
 static bool notify_sent       = false;  // prevent repeat notifications
 
 // ---- Thermal prediction ----
@@ -663,6 +665,17 @@ static float phone_gps_speed  = 0.0f;  // mph
 static bool  phone_gps_valid  = false;
 static uint32_t phone_gps_ms  = 0;
 #define PHONE_GPS_TIMEOUT_MS  5000UL
+
+// ---- TPMS (received from VESC module over CAN) ----
+static bool     tpms_enabled      = false;   // toggleable
+static float    tpms_front_psi    = 0.0f;
+static float    tpms_front_temp_f = 0.0f;
+static float    tpms_rear_psi     = 0.0f;
+static float    tpms_rear_temp_f  = 0.0f;
+static bool     tpms_front_valid  = false;
+static bool     tpms_rear_valid   = false;
+static uint32_t tpms_last_ms      = 0;
+#define TPMS_TIMEOUT_MS  60000UL  // sensor lost if no data for 60s
 
 // ---- Session summary for app logging (BLE characteristic) ----
 // Packed into existing charger telemetry + new session end characteristic
@@ -885,6 +898,19 @@ void can_driver_update(void) {
             Serial.println("[CAN] *** EMERGENCY STOP ***");
         } else if (msg.identifier == CAN_INTERMOD_CMD_ID) {
             can_process_intermod(&msg);
+        } else if (msg.identifier == CAN_TPMS_DATA_ID && tpms_enabled) {
+            // TPMS frame from VESC: byte0=wheel(0=front,1=rear), 1-2=psi*100, 3-4=temp_f*10
+            if (msg.data_length_code >= 5) {
+                uint8_t wheel = msg.data[0];
+                float psi = ((uint16_t)msg.data[1] << 8 | msg.data[2]) / 100.0f;
+                float temp = ((uint16_t)msg.data[3] << 8 | msg.data[4]) / 10.0f;
+                if (wheel == 0) {
+                    tpms_front_psi = psi; tpms_front_temp_f = temp; tpms_front_valid = true;
+                } else {
+                    tpms_rear_psi = psi; tpms_rear_temp_f = temp; tpms_rear_valid = true;
+                }
+                tpms_last_ms = millis();
+            }
         }
     }
 }
@@ -1802,14 +1828,14 @@ static void notify_charge_complete(float start_v, float end_v, float wh, float a
         if (ble_connected) ble_ch_session_end->notify();
     }
 
-    // Buzzer (if wired)
-    if (BUZZER_PIN >= 0) {
-        for (int i = 0; i < 3; i++) {
-            digitalWrite(BUZZER_PIN, HIGH);
-            delay(200);
-            digitalWrite(BUZZER_PIN, LOW);
-            delay(200);
-        }
+    // Flash RGB LED green 3 times to indicate completion
+    for (int i = 0; i < 3; i++) {
+        rgb_led_set_state(RGB_STATE_CHARGING);  // green
+        FastLED.show();
+        delay(300);
+        rgb_led_set_state(RGB_STATE_IDLE);      // off
+        FastLED.show();
+        delay(300);
     }
 }
 
@@ -2508,6 +2534,8 @@ static void cmd_print_help(void) {
     Serial.println("  NF,42.30 - Set lifetime cost ($)");
     Serial.println("  ND       - Dump all NVS values (backup)");
     Serial.println("  GA/GP/GB - GPS: onboard/phone/both");
+    Serial.println("  TPMS1    - Enable tire pressure (from VESC CAN)");
+    Serial.println("  TPMS0    - Disable tire pressure");
     Serial.println("========================================");
     Serial.println();
 }
@@ -2672,6 +2700,22 @@ static void cmd_print_status(void) {
     if (ttc > 0.0f && cmd_charging) {
         Serial.printf("  Thermal:  ~%.0f min to CAUTION at current rate (%.1fF/min rise)\n",
                       ttc, thermal_rise_rate_f_per_min);
+    }
+
+    // TPMS
+    if (tpms_enabled) {
+        Serial.println("  ---- TPMS ----");
+        bool stale = (millis() - tpms_last_ms) > TPMS_TIMEOUT_MS && tpms_last_ms > 0;
+        if (tpms_front_valid)
+            Serial.printf("  Front: %.1f PSI  %.0fF%s\n", tpms_front_psi, tpms_front_temp_f,
+                          stale ? " STALE" : "");
+        else
+            Serial.println("  Front: no data");
+        if (tpms_rear_valid)
+            Serial.printf("  Rear:  %.1f PSI  %.0fF%s\n", tpms_rear_psi, tpms_rear_temp_f,
+                          stale ? " STALE" : "");
+        else
+            Serial.println("  Rear:  no data");
     }
 
     // Maintain & Schedule
@@ -2930,6 +2974,19 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
                 }
             }
         }
+        return;
+    }
+
+    // TPMS toggle: TPMS1 (enable) TPMS0 (disable)
+    if (len >= 4 && buf[0] == 'T' && buf[1] == 'P' && buf[2] == 'M' && buf[3] == 'S') {
+        if (len >= 5) {
+            tpms_enabled = (buf[4] == '1');
+        } else {
+            tpms_enabled = !tpms_enabled;
+        }
+        Serial.printf("[TPMS] %s\n", tpms_enabled ? "ENABLED" : "DISABLED");
+        if (tpms_enabled)
+            Serial.println("       Listening for TPMS data from VESC module on CAN");
         return;
     }
 
@@ -3448,7 +3505,16 @@ static String wifi_build_status_json(void) {
     json += "\"gps_source\":\"" + String(gps_source == GPS_SOURCE_ONBOARD ? "ONBOARD" :
                                          gps_source == GPS_SOURCE_PHONE ? "PHONE" : "BOTH") + "\",";
     float ttc = thermal_time_to_caution_min();
-    json += "\"thermal_mins_to_caution\":" + String(ttc > 0 ? ttc : -1.0f, 0);
+    json += "\"thermal_mins_to_caution\":" + String(ttc > 0 ? ttc : -1.0f, 0) + ",";
+    json += "\"tpms_enabled\":" + String(tpms_enabled ? "true" : "false");
+    if (tpms_enabled) {
+        json += ",\"tpms_front_psi\":" + String(tpms_front_psi, 1);
+        json += ",\"tpms_front_temp_f\":" + String(tpms_front_temp_f, 0);
+        json += ",\"tpms_front_valid\":" + String(tpms_front_valid ? "true" : "false");
+        json += ",\"tpms_rear_psi\":" + String(tpms_rear_psi, 1);
+        json += ",\"tpms_rear_temp_f\":" + String(tpms_rear_temp_f, 0);
+        json += ",\"tpms_rear_valid\":" + String(tpms_rear_valid ? "true" : "false");
+    }
     json += "}";
     return json;
 }
@@ -3721,12 +3787,6 @@ void setup() {
                   test_dev_mode ? " [DEV MODE]" : "");
     Serial.printf("[NVS] Thermal zones: NORMAL<%.0fF CAUTION<%.0fF DANGER<%.0fF\n",
                   tz_normal_max_f, tz_caution_max_f, tz_danger_max_f);
-
-    // Buzzer pin (if wired)
-    if (BUZZER_PIN >= 0) {
-        pinMode(BUZZER_PIN, OUTPUT);
-        digitalWrite(BUZZER_PIN, LOW);
-    }
 
     // Start with charger disabled
     can_send_disable();
