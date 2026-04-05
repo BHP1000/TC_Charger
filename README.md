@@ -38,8 +38,8 @@ All contributions must be open source. If you want commercial rights, contact th
 ### CAN Transceiver
 | Item | Detail |
 |------|--------|
-| Chip | SN65HVD230 (WCMCU-230 module) |
-| Voltage | **3.3V only** -- do NOT use 5V transceivers (CJMCU-1051 will damage ESP32) |
+| Chip | SN65HVD230 (WCMCU-230) or CJMCU-1051 (TJA1051) |
+| Voltage | **3.3V only** -- both transceivers work at 3.3V. Do NOT power at 5V (will damage ESP32 GPIO) |
 | TX GPIO | 4 |
 | RX GPIO | 5 |
 | S pin | Must be tied to **GND** for normal operation |
