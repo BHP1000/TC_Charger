@@ -236,26 +236,106 @@ All energy calculations use smoothed values, which accurately reflect total ener
 
 ---
 
+## Hardware Requirements
+
+### Minimum ESP32-S3 Board Specs
+
+| Requirement | Minimum | This Project Uses |
+|---|---|---|
+| MCU | ESP32-S3 | ESP32-S3 DevKitC-1 |
+| Flash | **16 MB** | N16R8 (16MB Flash / 8MB PSRAM) |
+| PSRAM | 8 MB OPI | N16R8 |
+| USB | USB-to-UART bridge (CP2102/CH340) | DevKitC-1 has both native USB + UART bridge |
+
+**Important:** Boards with only 4MB flash (like the basic ESP32-S3-WROOM-1 N4) will NOT work. The compiled firmware is ~1.3MB and requires a 3MB APP partition which needs 16MB flash. Verify your board's flash size before purchasing.
+
+Common compatible boards:
+- ESP32-S3 DevKitC-1 **N16R8** (recommended, this is what we use)
+- ESP32-S3 DevKitC-1 N8R8 (8MB flash -- will work with smaller partition but tight)
+- Any ESP32-S3 board with 16MB+ flash and exposed GPIO 4, 5, 6, 7, 8, 9, 15, 16, 17, 18, 48
+
+---
+
 ## Arduino IDE Setup
 
-1. **Board package:** Install `esp32 by Espressif` from Boards Manager
-   - Board Manager URL: `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+Follow these steps exactly. Incorrect settings will cause boot loops, blank serial output, or flash errors.
 
-2. **Board settings:**
-   - Board: ESP32S3 Dev Module
-   - Flash Size: 16 MB
-   - PSRAM: OPI
-   - USB CDC On Boot: **Disabled** (critical -- Serial won't work on COM3 without this)
-   - Upload Speed: 921600
+### Step 1: Install ESP32 Board Package
 
-3. **Libraries** (install via Library Manager):
-   - FastLED
-   - U8g2
-   - Adafruit AHTX0
-   - Adafruit BMP280 Library
-   - TinyGPSPlus
+1. Open Arduino IDE
+2. Go to **File > Preferences**
+3. In "Additional Board Manager URLs" add:
+   ```
+   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+   ```
+4. Go to **Tools > Board > Boards Manager**
+5. Search for "esp32" and install **"esp32 by Espressif Systems"**
 
-4. **Flash:** Open `TC_Charger_MainBrain/TC_Charger_MainBrain.ino`, select COM3, upload.
+### Step 2: Board Settings (Tools Menu)
+
+Set each of these in the **Tools** menu. Every setting matters.
+
+| Setting | Value | Why |
+|---|---|---|
+| **Board** | ESP32S3 Dev Module | Matches our MCU |
+| **Flash Size** | **16MB (128Mb)** | Must match your board's physical flash. Using 4MB on a 16MB board causes boot loops with "partition table error" |
+| **Partition Scheme** | **16M Flash (3MB APP/9.9MB FATFS)** | Firmware is ~1.3MB, default 1.2MB partition is too small. This gives 3MB for the app |
+| **PSRAM** | **OPI** | N16R8 uses OPI PSRAM. Wrong setting = crash or no PSRAM |
+| **USB CDC On Boot** | **Disabled** | Critical. If "Enabled", Serial output goes to native USB instead of UART bridge (COM3). You'll see nothing in Putty/Serial Monitor. |
+| **Upload Speed** | 921600 | Fastest reliable speed |
+| **USB Mode** | Hardware CDC and JTAG | Default, leave as-is |
+| **Port** | COM3 (or your board's port) | Check Device Manager if unsure |
+
+### Step 3: Install Libraries
+
+Go to **Sketch > Include Library > Manage Libraries** and install:
+
+| Library | Search Term | Author |
+|---|---|---|
+| FastLED | FastLED | Daniel Garcia |
+| U8g2 | U8g2 | oliver |
+| Adafruit AHTX0 | Adafruit AHTX0 | Adafruit |
+| Adafruit BMP280 Library | Adafruit BMP280 | Adafruit |
+| TinyGPSPlus | TinyGPSPlus | Mikal Hart |
+
+Accept any dependency prompts (Adafruit BusIO, Adafruit Unified Sensor, etc.)
+
+### Step 4: Upload
+
+1. Open `TC_Charger_MainBrain/TC_Charger_MainBrain.ino`
+2. Select your port under **Tools > Port**
+3. Click **Upload** (arrow button)
+4. Open Serial Monitor or Putty at **115200 baud**
+5. Press the **RST** button on the board
+6. You should see the boot banner and status messages
+
+### Troubleshooting
+
+**Boot loop with "partition table error":**
+```
+E (29) flash_parts: partition 3 invalid - offset 0x310000 size 0x300000 exceeds flash chip size 0x400000
+```
+This means Flash Size is wrong (set to 4MB instead of 16MB) or a previous upload left a bad partition table.
+Fix:
+1. **Tools > Flash Size > 16MB (128Mb)**
+2. **Tools > Erase All Flash Before Sketch Upload > Enabled**
+3. Upload the sketch
+4. After successful boot, set **Erase All Flash** back to **Disabled** (so NVS settings are preserved on future uploads)
+
+**Blank serial output (nothing in Putty):**
+- Check **Tools > USB CDC On Boot** is set to **Disabled**
+- Make sure Putty is on the correct COM port at 115200 baud
+- Press RST on the board after opening Putty
+- In Putty settings: Terminal > check "Implicit CR in every LF" (fixes staircase text)
+
+**Sketch too big / exceeds available space:**
+- Check **Tools > Partition Scheme** is set to **"16M Flash (3MB APP/9.9MB FATFS)"**
+- The default 1.2MB APP partition is too small for this firmware
+
+**Upload fails / can't connect:**
+- Try holding the **BOOT** button while clicking Upload, release after "Connecting..." appears
+- Check that no other program (Putty, Serial Monitor) has the COM port open during upload
+- Try a different USB cable (some are charge-only, no data)
 
 ---
 
