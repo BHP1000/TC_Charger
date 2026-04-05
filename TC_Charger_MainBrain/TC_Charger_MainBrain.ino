@@ -52,6 +52,19 @@
 #define CAN_TX_INTERVAL_MS      1000UL
 #define CAN_CHARGER_TIMEOUT_MS  5000UL
 
+// CAN inter-module frame IDs
+#define CAN_EMERGENCY_STOP_ID    0x00010000UL  // highest priority on bus
+#define CAN_INTERMOD_CMD_ID      0x1A000001UL  // module -> Main Brain command
+#define CAN_INTERMOD_STATUS_ID   0x1A000002UL  // Main Brain -> modules broadcast
+
+// Inter-module command bytes (Byte 0 of CAN_INTERMOD_CMD_ID frame)
+#define INTERMOD_CMD_ESTOP       0x00
+#define INTERMOD_CMD_START       0x01
+#define INTERMOD_CMD_STOP        0x02
+#define INTERMOD_CMD_SET_AMPS    0x03  // Byte 1-2: current_da big-endian
+#define INTERMOD_CMD_SET_VOLTS   0x04  // Byte 1-2: voltage_dv big-endian
+#define INTERMOD_CMD_SET_PROFILE 0x05  // Byte 1: profile enum
+
 // ---- RS485 ----
 #define RS485_BAUD           115200
 #define RS485_TIMEOUT_MS     50
@@ -299,6 +312,84 @@ typedef struct {
 } Button_t;
 
 // =============================================================================
+//  FORWARD DECLARATIONS (must be before command state -- functions used early)
+// =============================================================================
+
+// CAN
+void     can_driver_init(void);
+bool     can_send_disable(void);
+bool     can_send_sleep(void);
+bool     can_send_command(const ChargerCmd_t *cmd);
+bool     can_read_status(ChargerStatus_t *out);
+void     can_driver_update(void);
+
+// RS485
+void rs485_init(void);
+bool rs485_send_packet(const RS485Packet_t *pkt);
+bool rs485_recv_packet(RS485Packet_t *pkt, uint32_t timeout_ms);
+void rs485_poll(void);
+bool rs485_request_temp_node(TempNodeData_t *out);
+bool rs485_get_last_temp_node(TempNodeData_t *out);
+bool rs485_request_bms(BMSData_t *out);
+bool rs485_get_last_bms(BMSData_t *out);
+
+// Thermal
+void               thermal_logic_init(void);
+void               thermal_logic_update(void);
+uint16_t           thermal_get_max_current_da(float max_temp_c);
+bool               thermal_is_overtemp(float temp_c);
+bool               thermal_is_undertemp(float temp_c);
+float              thermal_get_max_ntc_temp(void);
+const TempNodeData_t *thermal_get_last_data(void);
+
+// RGB LED
+void rgb_led_init(void);
+void rgb_led_set_state(RGBState_t state);
+void rgb_led_update(void);
+
+// Safety FSM
+const char *safety_state_name(SafetyState_t s);
+void        safety_sm_init(void);
+void        safety_sm_update(void);
+SafetyState_t safety_sm_get_state(void);
+void        safety_sm_report_bms_fault(bool fault);
+void        safety_sm_report_comm_timeout(bool timeout);
+
+// BLE
+void     ble_server_init(void);
+void     ble_server_update(void);
+bool     ble_server_is_connected(void);
+uint16_t ble_server_get_pack_voltage_dv(void);
+
+// OLED
+void oled_display_init(void);
+void oled_display_update(void);
+void oled_display_next_page(void);
+
+// BME280
+void bme280_init(void);
+void bme280_update(void);
+bool bme280_get(BME280Data_t *out);
+
+// GPS
+void gps_driver_init(void);
+void gps_driver_update(void);
+bool gps_driver_get(GPSData_t *out);
+
+// Buttons
+void button_driver_init(void);
+void button_driver_update(void);
+bool button_next_pressed(void);
+bool button_hold_active(void);
+
+// Serial/BLE/WiFi command processor
+static void cmd_process_char(char c);
+static void cmd_send_now(void);
+
+// CAN inter-module
+static void can_process_intermod(const twai_message_t *msg);
+
+// =============================================================================
 //  CHARGER COMMAND STATE (used by OLED display + serial command handler)
 // =============================================================================
 
@@ -522,80 +613,6 @@ static uint32_t time_update_ms       = 0;
 static char  cmd_buf[CMD_BUF_SIZE];
 static uint8_t cmd_buf_len = 0;
 static bool    cmd_buf_active = false;  // true when collecting multi-char command
-
-// =============================================================================
-//  FORWARD DECLARATIONS
-// =============================================================================
-
-// CAN
-void     can_driver_init(void);
-bool     can_send_disable(void);
-bool     can_send_sleep(void);
-bool     can_send_command(const ChargerCmd_t *cmd);
-bool     can_read_status(ChargerStatus_t *out);
-void     can_driver_update(void);
-
-// RS485
-void rs485_init(void);
-bool rs485_send_packet(const RS485Packet_t *pkt);
-bool rs485_recv_packet(RS485Packet_t *pkt, uint32_t timeout_ms);
-void rs485_poll(void);
-bool rs485_request_temp_node(TempNodeData_t *out);
-bool rs485_get_last_temp_node(TempNodeData_t *out);
-bool rs485_request_bms(BMSData_t *out);
-bool rs485_get_last_bms(BMSData_t *out);
-
-// Thermal
-void               thermal_logic_init(void);
-void               thermal_logic_update(void);
-uint16_t           thermal_get_max_current_da(float max_temp_c);
-bool               thermal_is_overtemp(float temp_c);
-bool               thermal_is_undertemp(float temp_c);
-float              thermal_get_max_ntc_temp(void);
-const TempNodeData_t *thermal_get_last_data(void);
-
-// RGB LED
-void rgb_led_init(void);
-void rgb_led_set_state(RGBState_t state);
-void rgb_led_update(void);
-
-// Safety FSM
-const char *safety_state_name(SafetyState_t s);
-void        safety_sm_init(void);
-void        safety_sm_update(void);
-SafetyState_t safety_sm_get_state(void);
-void        safety_sm_report_bms_fault(bool fault);
-void        safety_sm_report_comm_timeout(bool timeout);
-
-// BLE
-void     ble_server_init(void);
-void     ble_server_update(void);
-bool     ble_server_is_connected(void);
-uint16_t ble_server_get_pack_voltage_dv(void);
-
-// OLED
-void oled_display_init(void);
-void oled_display_update(void);
-void oled_display_next_page(void);
-
-// BME280
-void bme280_init(void);
-void bme280_update(void);
-bool bme280_get(BME280Data_t *out);
-
-// GPS
-void gps_driver_init(void);
-void gps_driver_update(void);
-bool gps_driver_get(GPSData_t *out);
-
-// Buttons
-void button_driver_init(void);
-void button_driver_update(void);
-bool button_next_pressed(void);
-bool button_hold_active(void);
-
-// Serial/BLE/WiFi command processor
-static void cmd_process_char(char c);
 
 // =============================================================================
 //  CAN DRIVER
@@ -3251,23 +3268,7 @@ static void wifi_update(void) {
 //  CAN INTER-MODULE FRAMES
 // =============================================================================
 // Other modules on the shared CAN bus can send commands to the charger Main Brain.
-// These use higher IDs (lower priority) than the charger control frames.
-
-// Emergency safety frame: any module can send this to force shutdown
-#define CAN_EMERGENCY_STOP_ID    0x00010000UL  // highest priority on bus
-
-// Inter-module command IDs (from other ESP32 modules to Main Brain)
-#define CAN_INTERMOD_CMD_ID      0x1A000001UL  // module -> Main Brain command
-#define CAN_INTERMOD_STATUS_ID   0x1A000002UL  // Main Brain -> modules status broadcast
-
-// Inter-module command bytes:
-// Byte 0: command type
-#define INTERMOD_CMD_ESTOP       0x00  // emergency stop
-#define INTERMOD_CMD_START       0x01  // request charge start
-#define INTERMOD_CMD_STOP        0x02  // request charge stop
-#define INTERMOD_CMD_SET_AMPS    0x03  // Byte 1-2: current_da (big-endian)
-#define INTERMOD_CMD_SET_VOLTS   0x04  // Byte 1-2: voltage_dv (big-endian)
-#define INTERMOD_CMD_SET_PROFILE 0x05  // Byte 1: profile enum
+// IDs and command bytes defined at top of file with other CAN constants.
 
 static void can_process_intermod(const twai_message_t *msg) {
     if (msg->data_length_code < 1) return;
@@ -3324,16 +3325,6 @@ static void can_process_intermod(const twai_message_t *msg) {
             }
             break;
     }
-}
-
-// Process inter-module frames from CAN RX queue
-// Called from can_driver_update -- we need to modify it to also check our IDs
-static void can_check_intermod(void) {
-    // The main CAN driver already drains the queue for charger frames.
-    // Inter-module frames with different IDs will also be in the queue
-    // if we set the filter to accept-all (which happens as fallback).
-    // For now, inter-module processing happens inside can_driver_update
-    // where we already iterate received frames.
 }
 
 // =============================================================================
