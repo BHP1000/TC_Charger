@@ -1,0 +1,1860 @@
+=== PAGE 1 ===
+JK BMS RS485 Modbus General Protocol (V1.0)
+Translated from Chinese Original — Technical/Literal Translation for Protocol Implementation
+The JK BMS RS485 Modbus General Protocol uses a master-slave request-response communication model. Only the
+master can initiate requests via the unique slave address, and the BMS (slave) responds according to the master's
+requests, implementing half-duplex communication. This protocol only allows the master to initiate requests while the
+slave responds passively; therefore, the slave will never actively occupy the communication line, preventing data
+collisions.
+Table of Contents
+1. I. Physical Interface
+2. II. Protocol Format
+3. III. Error Feedback
+4. IV. Information Transmission Process
+5. V. Function Code Analysis
+6. VI. Register Map — Configuration Registers (0x1000)
+7. VII. Register Map — Real-Time Data Registers (0x1200)
+8. VIII. Register Map — Device Information Registers (0x1400)
+9. IX. Register Map — Command Registers (0x1600)
+I. Physical Interface
+The electrical characteristics of the communication physical interface are as follows:
+Parameter
+Value
+Communication Interface
+UART
+Electrical Standard
+RS485
+Baud Rate
+115200 bps
+Data Bits
+8
+Stop Bits
+1
+Parity
+None
+II. Protocol Format
+Information transmission is asynchronous, using hexadecimal for communication. The message frame format is:
+Address Code
+Function Code
+Data Area
+CRC Checksum
+1 Byte
+1 Byte
+N Bytes
+2 Bytes
+1) Address Code
+The address code is the first byte of each communication frame. It supports values from 1 to 247. Each slave must have
+a unique address on the bus. Only the slave whose address matches the address code sent by the master will respond
+and return data.
+2) Function Code
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+1/15
+
+=== PAGE 2 ===
+The function code is the second byte of each communication frame. Sent by the master, it instructs the slave device
+which operation to perform. The function code definitions are:
+Function Code
+Definition
+Operation
+03H
+Read Register(s)
+Read data from one or more registers
+10H
+Write Register(s)
+Write data to one or more registers
+3) Data Area
+The data area varies depending on the function code and data direction. The data may be combinations such as "starting
+register address + number of registers to read", "register address + operation data", or "starting register address +
+number of registers to operate + data length + data", etc. Detailed data area formats for different function codes are
+explained in the "Function Code Analysis" section.
+4) CRC Checksum
+The CRC checksum is used to ensure the correctness and integrity of data transmission.
+III. Error Feedback
+Address and CRC checksum errors will not receive any data feedback from the slave. Other errors will return error codes
+to the master. The second byte of the data frame is the original function code with 0x80 added, indicating a request error
+(illegal function code, illegal data value, etc.). The error data frame format is:
+Address Code
+Function Code
+Error Code Area
+CRC Checksum
+1 Byte
+1 Byte
+1 Byte
+2 Bytes
+Error code definitions:
+Value
+Name
+Description
+01H
+Illegal Function Code
+The function code is not supported for operating the register
+02H
+Register Address Error
+Attempted to access a register that the slave prohibits access to
+03H
+Illegal Data
+Data logic is invalid or exceeds limits
+04H
+CRC Checksum Error
+CRC checksum error
+IV. Information Transmission Process
+When a communication command is sent by the master to the slave, the slave whose address matches the address code
+sent by the master receives the communication command. If the CRC checksum is correct, the slave executes the
+corresponding operation and returns the execution result (data) to the master. The return message contains the address
+code, function code, post-execution data, and CRC checksum. If the address does not match or the CRC checksum is
+incorrect, no information is returned.
+V. Function Code Analysis
+1) Function Code 03H: Read Register(s)
+Example: The master wants to read 2 holding registers starting from register address 05H of slave address 01H. Master
+sends:
+Master Sends
+Data (HEX)
+Address Code
+01H
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+2/15
+
+=== PAGE 3 ===
+Function Code
+03H
+Starting Register Address
+High Byte
+00H
+Low Byte
+05H
+Number of Registers
+High Byte
+00H
+Low Byte
+02H
+CRC Checksum
+Low Byte
+D4H
+High Byte
+0AH
+If the slave's holding registers 05H and 06H contain data 1122H and 3344H, the slave returns:
+Slave Returns
+Data (HEX)
+Address Code
+01H
+Function Code
+03H
+Byte Count
+04H
+Register 05 Data
+High Byte
+11H
+Low Byte
+22H
+Register 06 Data
+High Byte
+33H
+Low Byte
+44H
+CRC Checksum
+Low Byte
+4BH
+High Byte
+C6H
+2) Function Code 10H: Write Register(s)
+Example: The master wants to write data 0005H and 2233H to 2 registers starting at register address 0020H of slave
+address 01H. Master sends:
+Master Sends
+Data (HEX)
+Address Code
+01H
+Function Code
+10H
+Starting Register Address
+High Byte
+00H
+Low Byte
+20H
+Number of Registers
+High Byte
+00H
+Low Byte
+02H
+Write Byte Count
+04H
+Register 0000H
+Data to Write
+High Byte
+00H
+Low Byte
+05H
+Register 0001H
+Data to Write
+High Byte
+22H
+Low Byte
+33H
+CRC Checksum
+Low Byte
+B9H
+High Byte
+03H
+Function code 10H operation, slave returns:
+Slave Returns
+Data (HEX)
+Address Code
+01H
+Function Code
+10H
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+3/15
+
+=== PAGE 4 ===
+Starting Register Address
+High Byte
+00H
+Low Byte
+20H
+Number of Registers
+High Byte
+00H
+Low Byte
+02H
+CRC Checksum
+Low Byte
+40H
+High Byte
+02H
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+4/15
+
+=== PAGE 5 ===
+VI. Register Map — Configuration Registers (Base Address: 0x1000)
+These registers are used for BMS configuration parameters. All registers in this section are Read/Write (RW) with UINT32
+type (4 bytes) unless otherwise specified.
+Protection & Voltage Configuration
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0000
+0
+UINT32 4
+RW
+Smart Sleep Entry Voltage — VolSmartSleep
+mV
+0x0004
+4
+UINT32 4
+RW
+Cell Under-Voltage Protection — VolCellUV
+mV
+0x0008
+8
+UINT32 4
+RW
+Cell Under-Voltage Protection Recovery —
+VolCellUVPR
+mV
+0x000C
+12
+UINT32 4
+RW
+Cell Over-Charge Protection — VolCellOV
+mV
+0x0010
+16
+UINT32 4
+RW
+Cell Over-Charge Protection Recovery Voltage —
+VolCellOVPR
+mV
+0x0014
+20
+UINT32 4
+RW
+Balance Trigger Voltage Difference — VolBalanTrig
+mV
+0x0018
+24
+UINT32 4
+RW
+SOC 100% Voltage — VolSOC100%
+mV
+0x001C
+28
+UINT32 4
+RW
+SOC 0% Voltage — VolSOC0%
+mV
+0x0028
+40
+UINT32 4
+RW
+Auto Power-Off Voltage — VolSysPwrOff
+mV
+Current Protection Configuration
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x002C
+44
+UINT32 4
+RW
+Continuous Charge Current — CurBatCOC
+mA
+0x0030
+48
+UINT32 4
+RW
+Charge Over-Current Protection Delay —
+TIMBatCOCPDly
+S
+0x0034
+52
+UINT32 4
+RW
+Charge Over-Current Protection Release Delay —
+TIMBatCOCPRDly
+S
+0x0038
+56
+UINT32 4
+RW
+Continuous Discharge Current — CurBatDcOC
+mA
+0x003C
+60
+UINT32 4
+RW
+Discharge Over-Current Protection Delay —
+TIMBatDcOCPDly
+S
+0x0040
+64
+UINT32 4
+RW
+Discharge Over-Current Protection Release Delay
+— TIMBatDcOCPRDly
+S
+0x0044
+68
+UINT32 4
+RW
+Short-Circuit Protection Release Delay —
+TIMBatSCPRDly
+S
+0x0048
+72
+UINT32 4
+RW
+Maximum Balancing Current — CurBalanMax
+mA
+Temperature Protection Configuration
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x004C
+76
+INT32
+4
+RW
+Charge Over-Temperature Protection —
+TMPBatCOT
+0.1°C
+0x0050
+80
+INT32
+4
+RW
+Charge Over-Temperature Recovery —
+TMPBatCOTPR
+0.1°C
+0x0054
+84
+INT32
+4
+RW
+Discharge Over-Temperature Protection —
+TMPBatDcOT
+0.1°C
+0x0058
+88
+INT32
+4
+RW
+Discharge Over-Temperature Recovery —
+TMPBatDcOTPR
+0.1°C
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+5/15
+
+=== PAGE 6 ===
+0x005C
+92
+INT32
+4
+RW
+Charge Under-Temperature Protection —
+TMPBatCUT
+0.1°C
+0x0060
+96
+INT32
+4
+RW
+Charge Under-Temperature Recovery —
+TMPBatCUTPR
+0.1°C
+0x0064
+100
+INT32
+4
+RW
+MOS Over-Temperature Protection — TMPMosOT
+0.1°C
+0x0068
+104
+INT32
+4
+RW
+MOS Over-Temperature Protection Recovery —
+TMPMosOTPR
+0.1°C
+Battery & Switch Configuration
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x006C
+108
+UINT32 4
+RW
+Cell Count — CellCount
+Series
+0x0070
+112
+UINT32 4
+RW
+Charge Switch — BatChargeEN
+1: ON; 0: OFF
+0x0074
+116
+UINT32 4
+RW
+Discharge Switch — BatDisChargeEN
+1: ON; 0: OFF
+0x0078
+120
+UINT32 4
+RW
+Balance Switch — BalanEN
+1: ON; 0: OFF
+0x007C
+124
+UINT32 4
+RW
+Battery Design Capacity — CapBatCell
+mAH
+0x0080
+128
+UINT32 4
+RW
+Short-Circuit Protection Delay — SCPDelay
+μs
+0x0084
+132
+UINT32 4
+RW
+Balance Start Voltage — VolStartBalan
+mV
+Connection Wire Internal Resistance (Cells 0–31)
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0088
+136
+UINT32 4
+RW
+Connection Wire Resistance 0 — CellConWireRes0
+μΩ
+0x008C
+140
+UINT32 4
+RW
+Connection Wire Resistance 1 — CellConWireRes1
+μΩ
+0x0090
+144
+UINT32 4
+RW
+Connection Wire Resistance 2 — CellConWireRes2
+μΩ
+0x0094
+148
+UINT32 4
+RW
+Connection Wire Resistance 3 — CellConWireRes3
+μΩ
+0x0098
+152
+UINT32 4
+RW
+Connection Wire Resistance 4 — CellConWireRes4
+μΩ
+0x009C
+156
+UINT32 4
+RW
+Connection Wire Resistance 5 — CellConWireRes5
+μΩ
+0x00A0
+160
+UINT32 4
+RW
+Connection Wire Resistance 6 — CellConWireRes6
+μΩ
+0x00A4
+164
+UINT32 4
+RW
+Connection Wire Resistance 7 — CellConWireRes7
+μΩ
+0x00A8
+168
+UINT32 4
+RW
+Connection Wire Resistance 8 — CellConWireRes8
+μΩ
+0x00AC
+172
+UINT32 4
+RW
+Connection Wire Resistance 9 — CellConWireRes9
+μΩ
+0x00B0
+176
+UINT32 4
+RW
+Connection Wire Resistance 10 —
+CellConWireRes10
+μΩ
+0x00B4
+180
+UINT32 4
+RW
+Connection Wire Resistance 11 —
+CellConWireRes11
+μΩ
+0x00B8
+184
+UINT32 4
+RW
+Connection Wire Resistance 12 —
+CellConWireRes12
+μΩ
+0x00BC
+188
+UINT32 4
+RW
+Connection Wire Resistance 13 —
+CellConWireRes13
+μΩ
+0x00C0
+192
+UINT32 4
+RW
+Connection Wire Resistance 14 —
+CellConWireRes14
+μΩ
+0x00C4
+196
+UINT32 4
+RW
+Connection Wire Resistance 15 —
+CellConWireRes15
+μΩ
+0x00C8
+200
+UINT32 4
+RW
+Connection Wire Resistance 16 —
+CellConWireRes16
+μΩ
+0x00CC
+204
+UINT32 4
+RW
+Connection Wire Resistance 17 —
+CellConWireRes17
+μΩ
+0x00D0
+208
+UINT32 4
+RW
+Connection Wire Resistance 18 —
+CellConWireRes18
+μΩ
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+6/15
+
+=== PAGE 7 ===
+0x00D4
+212
+UINT32 4
+RW
+Connection Wire Resistance 19 —
+CellConWireRes19
+μΩ
+0x00D8
+216
+UINT32 4
+RW
+Connection Wire Resistance 20 —
+CellConWireRes20
+μΩ
+0x00DC
+220
+UINT32 4
+RW
+Connection Wire Resistance 21 —
+CellConWireRes21
+μΩ
+0x00E0
+224
+UINT32 4
+RW
+Connection Wire Resistance 22 —
+CellConWireRes22
+μΩ
+0x00E4
+228
+UINT32 4
+RW
+Connection Wire Resistance 23 —
+CellConWireRes23
+μΩ
+0x00E8
+232
+UINT32 4
+RW
+Connection Wire Resistance 24 —
+CellConWireRes24
+μΩ
+0x00EC
+236
+UINT32 4
+RW
+Connection Wire Resistance 25 —
+CellConWireRes25
+μΩ
+0x00F0
+240
+UINT32 4
+RW
+Connection Wire Resistance 26 —
+CellConWireRes26
+μΩ
+0x00F4
+244
+UINT32 4
+RW
+Connection Wire Resistance 27 —
+CellConWireRes27
+μΩ
+0x00F8
+248
+UINT32 4
+RW
+Connection Wire Resistance 28 —
+CellConWireRes28
+μΩ
+0x00FC
+252
+UINT32 4
+RW
+Connection Wire Resistance 29 —
+CellConWireRes29
+μΩ
+0x0100
+256
+UINT32 4
+RW
+Connection Wire Resistance 30 —
+CellConWireRes30
+μΩ
+0x0104
+260
+UINT32 4
+RW
+Connection Wire Resistance 31 —
+CellConWireRes31
+μΩ
+Device & Miscellaneous Configuration
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0108
+264
+UINT32 4
+RW
+Device Address — DevAddr
+H
+0x010C
+268
+UINT32 4
+RW
+Discharge Pre-Charge Time — TIMProdischarge
+S
+Bitfield Register at 0x0114 (UINT16, 2 bytes, RW)
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note / Bit
+0x0114
+276
+UINT16 2
+RW
+Heating Switch — HeatEN
+1: ON; 0: OFF — BIT0
+RW
+Temperature Sensor Disable — Disable temp-
+sensor
+1: ON; 0: OFF — BIT1
+RW
+GPS Heartbeat Detection — GPS Heartbeat
+1: ON; 0: OFF — BIT2
+RW
+Multiplexed Port Function — Port Switch
+1: RS485; 0: CAN — BIT3
+RW
+Display Always On — LCD Always On
+1: ON; 0: OFF — BIT4
+RW
+Dedicated Charger Recognition — Special Charger
+1: ON; 0: OFF — BIT5
+RW
+Smart Sleep — SmartSleep
+1: ON; 0: OFF — BIT6
+Registers at 0x0116 and 0x0118
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0116
+278
+INT8
+2
+RW
+Battery Alarm Temperature — TMPBatOTA
+°C
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+7/15
+
+=== PAGE 8 ===
+INT8
+RW
+Battery Alarm Recovery Temperature —
+TMPBatOTAR
+°C
+0x0118
+280
+UINT8
+2
+RW
+Smart Sleep Time — TIMSmartSleep
+H
+UINT8
+R
+Data Domain Enable Control 0
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+8/15
+
+=== PAGE 9 ===
+VII. Register Map — Real-Time Data Registers (Base Address: 0x1200)
+These registers provide real-time battery monitoring data. All registers in this section are Read-Only (R).
+Individual Cell Voltages (Cells 0–31)
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0000
+0
+UINT16 2
+R
+Cell Voltage 0 — CellVol0
+mV
+0x0002
+2
+UINT16 2
+R
+Cell Voltage 1 — CellVol1
+mV
+0x0004
+4
+UINT16 2
+R
+Cell Voltage 2 — CellVol2
+mV
+0x0006
+6
+UINT16 2
+R
+Cell Voltage 3 — CellVol3
+mV
+0x0008
+8
+UINT16 2
+R
+Cell Voltage 4 — CellVol4
+mV
+0x000A
+10
+UINT16 2
+R
+Cell Voltage 5 — CellVol5
+mV
+0x000C
+12
+UINT16 2
+R
+Cell Voltage 6 — CellVol6
+mV
+0x000E
+14
+UINT16 2
+R
+Cell Voltage 7 — CellVol7
+mV
+0x0010
+16
+UINT16 2
+R
+Cell Voltage 8 — CellVol8
+mV
+0x0012
+18
+UINT16 2
+R
+Cell Voltage 9 — CellVol9
+mV
+0x0014
+20
+UINT16 2
+R
+Cell Voltage 10 — CellVol10
+mV
+0x0016
+22
+UINT16 2
+R
+Cell Voltage 11 — CellVol11
+mV
+0x0018
+24
+UINT16 2
+R
+Cell Voltage 12 — CellVol12
+mV
+0x001A
+26
+UINT16 2
+R
+Cell Voltage 13 — CellVol13
+mV
+0x001C
+28
+UINT16 2
+R
+Cell Voltage 14 — CellVol14
+mV
+0x001E
+30
+UINT16 2
+R
+Cell Voltage 15 — CellVol15
+mV
+0x0020
+32
+UINT16 2
+R
+Cell Voltage 16 — CellVol16
+mV
+0x0022
+34
+UINT16 2
+R
+Cell Voltage 17 — CellVol17
+mV
+0x0024
+36
+UINT16 2
+R
+Cell Voltage 18 — CellVol18
+mV
+0x0026
+38
+UINT16 2
+R
+Cell Voltage 19 — CellVol19
+mV
+0x0028
+40
+UINT16 2
+R
+Cell Voltage 20 — CellVol20
+mV
+0x002A
+42
+UINT16 2
+R
+Cell Voltage 21 — CellVol21
+mV
+0x002C
+44
+UINT16 2
+R
+Cell Voltage 22 — CellVol22
+mV
+0x002E
+46
+UINT16 2
+R
+Cell Voltage 23 — CellVol23
+mV
+0x0030
+48
+UINT16 2
+R
+Cell Voltage 24 — CellVol24
+mV
+0x0032
+50
+UINT16 2
+R
+Cell Voltage 25 — CellVol25
+mV
+0x0034
+52
+UINT16 2
+R
+Cell Voltage 26 — CellVol26
+mV
+0x0036
+54
+UINT16 2
+R
+Cell Voltage 27 — CellVol27
+mV
+0x0038
+56
+UINT16 2
+R
+Cell Voltage 28 — CellVol28
+mV
+0x003A
+58
+UINT16 2
+R
+Cell Voltage 29 — CellVol29
+mV
+0x003C
+60
+UINT16 2
+R
+Cell Voltage 30 — CellVol30
+mV
+0x003E
+62
+UINT16 2
+R
+Cell Voltage 31 — CellVol31
+mV
+Battery Status & Statistics
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0040
+64
+UINT32 4
+R
+Cell Status — CellSta
+BIT[n]=1 indicates cell n is present
+0x0044
+68
+UINT16 2
+R
+Cell Average Voltage — CellVolAve
+mV
+0x0046
+70
+UINT16 2
+R
+Maximum Voltage Difference — CellVdifMax
+mV
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+9/15
+
+=== PAGE 10 ===
+0x0048
+72
+UINT8
+2
+R
+Highest Voltage Cell Number — MaxVolCellNbr
+UINT8
+R
+Lowest Voltage Cell Number — MinVolCellNbr
+Balance Wire Resistance (Cells 0–31)
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x004A
+74
+UINT16 2
+R
+Balance Wire Resistance 0 — CellWireRes0
+mΩ
+0x004C
+76
+UINT16 2
+R
+Balance Wire Resistance 1 — CellWireRes1
+mΩ
+0x004E
+78
+UINT16 2
+R
+Balance Wire Resistance 2 — CellWireRes2
+mΩ
+0x0050
+80
+UINT16 2
+R
+Balance Wire Resistance 3 — CellWireRes3
+mΩ
+0x0052
+82
+UINT16 2
+R
+Balance Wire Resistance 4 — CellWireRes4
+mΩ
+0x0054
+84
+UINT16 2
+R
+Balance Wire Resistance 5 — CellWireRes5
+mΩ
+0x0056
+86
+UINT16 2
+R
+Balance Wire Resistance 6 — CellWireRes6
+mΩ
+0x0058
+88
+UINT16 2
+R
+Balance Wire Resistance 7 — CellWireRes7
+mΩ
+0x005A
+90
+UINT16 2
+R
+Balance Wire Resistance 8 — CellWireRes8
+mΩ
+0x005C
+92
+UINT16 2
+R
+Balance Wire Resistance 9 — CellWireRes9
+mΩ
+0x005E
+94
+UINT16 2
+R
+Balance Wire Resistance 10 — CellWireRes10
+mΩ
+0x0060
+96
+UINT16 2
+R
+Balance Wire Resistance 11 — CellWireRes11
+mΩ
+0x0062
+98
+UINT16 2
+R
+Balance Wire Resistance 12 — CellWireRes12
+mΩ
+0x0064
+100
+UINT16 2
+R
+Balance Wire Resistance 13 — CellWireRes13
+mΩ
+0x0066
+102
+UINT16 2
+R
+Balance Wire Resistance 14 — CellWireRes14
+mΩ
+0x0068
+104
+UINT16 2
+R
+Balance Wire Resistance 15 — CellWireRes15
+mΩ
+0x006A
+106
+UINT16 2
+R
+Balance Wire Resistance 16 — CellWireRes16
+mΩ
+0x006C
+108
+UINT16 2
+R
+Balance Wire Resistance 17 — CellWireRes17
+mΩ
+0x006E
+110
+UINT16 2
+R
+Balance Wire Resistance 18 — CellWireRes18
+mΩ
+0x0070
+112
+UINT16 2
+R
+Balance Wire Resistance 19 — CellWireRes19
+mΩ
+0x0072
+114
+UINT16 2
+R
+Balance Wire Resistance 20 — CellWireRes20
+mΩ
+0x0074
+116
+UINT16 2
+R
+Balance Wire Resistance 21 — CellWireRes21
+mΩ
+0x0076
+118
+UINT16 2
+R
+Balance Wire Resistance 22 — CellWireRes22
+mΩ
+0x0078
+120
+UINT16 2
+R
+Balance Wire Resistance 23 — CellWireRes23
+mΩ
+0x007A
+122
+UINT16 2
+R
+Balance Wire Resistance 24 — CellWireRes24
+mΩ
+0x007C
+124
+UINT16 2
+R
+Balance Wire Resistance 25 — CellWireRes25
+mΩ
+0x007E
+126
+UINT16 2
+R
+Balance Wire Resistance 26 — CellWireRes26
+mΩ
+0x0080
+128
+UINT16 2
+R
+Balance Wire Resistance 27 — CellWireRes27
+mΩ
+0x0082
+130
+UINT16 2
+R
+Balance Wire Resistance 28 — CellWireRes28
+mΩ
+0x0084
+132
+UINT16 2
+R
+Balance Wire Resistance 29 — CellWireRes29
+mΩ
+0x0086
+134
+UINT16 2
+R
+Balance Wire Resistance 30 — CellWireRes30
+mΩ
+0x0088
+136
+UINT16 2
+R
+Balance Wire Resistance 31 — CellWireRes31
+mΩ
+Temperature, Voltage, Current & Power
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x008A
+138
+INT16
+2
+R
+Power Board Temperature — TempMos
+0.1°C
+0x008C
+140
+UINT32 4
+R
+Balance Wire Resistance Status — CellWireResSta
+BIT[n]=1 indicates balance wire n alarm
+0x0090
+144
+UINT32 4
+R
+Battery Total Voltage — BatVol
+mV
+0x0094
+148
+UINT32 4
+R
+Battery Power — BatWatt
+mW
+0x0098
+152
+INT32
+4
+R
+Battery Current — BatCurrent
+mA
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+10/15
+
+=== PAGE 11 ===
+0x009C
+156
+INT16
+2
+R
+Battery Temperature 1 — TempBat 1
+0.1°C
+0x009E
+158
+INT16
+2
+R
+Battery Temperature 2 — TempBat 2
+0.1°C
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+11/15
+
+=== PAGE 12 ===
+Alarm / Fault Status Register (0x00A0, UINT32, 4 bytes, R)
+Bit
+Alarm Name (English)
+Value Definition
+BIT0
+Balance Wire Resistance Too High — AlarmWireRes
+1: Fault; 0: Normal
+BIT1
+MOS Over-Temperature Protection — AlarmMosOTP
+1: Fault; 0: Normal
+BIT2
+Cell Count Mismatch with Setting — AlarmCellQuantity
+1: Fault; 0: Normal
+BIT3
+Current Sensor Abnormal — AlarmCurSensorErr
+1: Fault; 0: Normal
+BIT4
+Cell Over-Voltage Protection — AlarmCellOVP
+1: Fault; 0: Normal
+BIT5
+Battery Over-Voltage Protection — AlarmBatOVP
+1: Fault; 0: Normal
+BIT6
+Charge Over-Current Protection — AlarmChOCP
+1: Fault; 0: Normal
+BIT7
+Charge Short-Circuit Protection — AlarmChSCP
+1: Fault; 0: Normal
+BIT8
+Charge Over-Temperature Protection — AlarmChOTP
+1: Fault; 0: Normal
+BIT9
+Charge Under-Temperature Protection — AlarmChUTP
+1: Fault; 0: Normal
+BIT10
+Internal Communication Abnormal — AlarmCPUAuxCommuErr
+1: Fault; 0: Normal
+BIT11
+Cell Under-Voltage Protection — AlarmCellUVP
+1: Fault; 0: Normal
+BIT12
+Battery Under-Voltage Protection — AlarmBatUVP
+1: Fault; 0: Normal
+BIT13
+Discharge Over-Current Protection — AlarmDchOCP
+1: Fault; 0: Normal
+BIT14
+Discharge Short-Circuit Protection — AlarmDchSCP
+1: Fault; 0: Normal
+BIT15
+Discharge Over-Temperature Protection — AlarmDchOTP
+1: Fault; 0: Normal
+BIT16
+Charge MOSFET Abnormal — AlarmChargeMOS
+1: Fault; 0: Normal
+BIT17
+Discharge MOSFET Abnormal — AlarmDischargeMOS
+1: Fault; 0: Normal
+BIT18
+GPS Disconnected — GPSDisconnected
+1: Fault; 0: Normal
+BIT19
+Please Modify Authorization Password in Time — Modify PWD. in time 1: Fault; 0: Normal
+BIT20
+Discharge Enable Failed — Discharge On Failed
+1: Fault; 0: Normal
+BIT21
+Battery Over-Temperature Alarm — Battery Over Temp Alarm
+1: Fault; 0: Normal
+SOC, Balancing & Capacity Data
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x00A4
+164
+INT16
+2
+R
+Balancing Current — BalanCurrent
+mA
+0x00A6
+166
+UINT8
+2
+R
+Balancing Status — BalanSta
+2: Discharging; 1: Charging; 0: Off
+UINT8
+R
+State of Charge — SOCStateOfcharge
+%
+0x00A8
+168
+INT32
+4
+R
+Remaining Capacity — SOCCapRemain
+mAH
+0x00AC
+172
+UINT32 4
+R
+Battery Actual Full Charge Capacity —
+SOCFullChargeCap
+mAH
+0x00B0
+176
+UINT32 4
+R
+Cycle Count — SOCCycleCount
+Times
+0x00B4
+180
+UINT32 4
+R
+Cycle Total Capacity — SOCCycleCap
+mAH
+0x00B8
+184
+UINT8
+2
+R
+State of Health Estimate — SOCSOH
+%
+UINT8
+R
+Pre-Charge Status — Precharge
+1: ON; 0: OFF
+0x00BA
+186
+UINT16 2
+R
+User Layer Alarm — UserAlarm
+0x00BC
+188
+UINT32 4
+R
+Run Time — RunTime
+S
+0x00C0
+192
+UINT8
+2
+R
+Charge Status — Charge
+1: ON; 0: OFF
+UINT8
+R
+Discharge Status — Discharge
+1: ON; 0: OFF
+0x00C2
+194
+UINT16 2
+R
+User Layer Alarm 2 — UserAlarm2
+Protection Release Timers
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+12/15
+
+=== PAGE 13 ===
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x00C4
+196
+UINT16 2
+R
+Discharge Over-Current Protection Release Time —
+TimeDcOCPR
+S
+0x00C6
+198
+UINT16 2
+R
+Discharge Short-Circuit Protection Release Time —
+TimeDcSCPR
+S
+0x00C8
+200
+UINT16 2
+R
+Charge Over-Current Protection Release Time —
+TimeCOCPR
+S
+0x00CA
+202
+UINT16 2
+R
+Charge Short-Circuit Protection Release Time —
+TimeCSCPR
+S
+0x00CC
+204
+UINT16 2
+R
+Cell Under-Voltage Protection Release Time —
+TimeUVPR
+S
+0x00CE
+206
+UINT16 2
+R
+Cell Over-Voltage Protection Release Time —
+TimeOVPR
+S
+Temperature Sensor Status Register (0x00D0, UINT8, 2 bytes, R)
+Bit
+Sensor Name
+Value Definition
+BIT0
+MOS Temperature Sensor — MOS TempSensorAbsent
+1: Present; 0: Absent
+BIT1
+Battery Temperature Sensor 1 — BATTempSensor1Absent
+1: Present; 0: Absent
+BIT2
+Battery Temperature Sensor 2 — BATTempSensor2Absent
+1: Present; 0: Absent
+BIT4
+Battery Temperature Sensor 4 — BATTempSensor4Absent
+1: Present; 0: Absent
+BIT5
+Battery Temperature Sensor 5 — BATTempSensor5Absent
+1: Present; 0: Absent
+Note: The second UINT8 byte at this address is: Heating Status — Heating (1: ON; 0: OFF)
+Miscellaneous Real-Time Data
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x00D2
+210
+UINT16 2
+R
+Reserved — Reserved
+0x00D4
+212
+UINT16 2
+R
+Emergency Switch Time — TimeEmergency
+S
+0x00D6
+214
+UINT16 2
+R
+Battery Current Correction Factor — BatCurCorrect
+0x00D8
+216
+UINT16 2
+R
+Charge Current Sensor Voltage — VolChargCur
+mV
+0x00DA
+218
+UINT16 2
+R
+Discharge Current Sensor Voltage —
+VolDischargCur
+mV
+0x00DC
+220
+FLOAT
+4
+R
+Battery Voltage Correction Factor — BatVolCorrect
+0x00E0
+224
+UINT16 2
+R
+Balance Charge PWM Duty Cycle —
+ChargePWMDutyCycle
+%
+0x00E2
+226
+UINT16 2
+R
+Balance Discharge PWM Duty Cycle —
+DischargePWMDutyCycle
+%
+0x00E4
+228
+UINT16 2
+R
+Battery Voltage — BatVol
+0.01V
+0x00E6
+230
+UINT16 2
+R
+Heating Current — HeatCurrent
+mA
+0x00EE
+238
+UINT8
+2
+R
+Reserved — RVD
+UINT8
+R
+Charger Status — ChargerPlugged
+1: Plugged in; 0: Not plugged in
+0x00F0
+240
+UINT32 4
+R
+System Run Ticks — SysRunTicks
+0.1S
+0x00F4
+244
+UINT32 4
+R
+PVD Trigger Timestamp — PVDTrigTimestamps
+0.1S
+0x00F8
+248
+INT16
+2
+R
+Battery Temperature 3 — TempBat 3
+0.1°C
+0x00FA
+250
+INT16
+2
+R
+Battery Temperature 4 — TempBat 4
+0.1°C
+0x00FC
+252
+INT16
+2
+R
+Battery Temperature 5 — TempBat 5
+0.1°C
+0x0100
+256
+UINT32 4
+R
+RTC Counter — RTCTicks
+Counting from 2020-01-01
+0x0108
+264
+UINT32 4
+R
+Time to Enter Sleep — TimeEnterSleep
+S
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+13/15
+
+=== PAGE 14 ===
+0x010C
+268
+UINT8
+2
+R
+Parallel Current Limiting Module Status —
+PCLModuleSta
+1: ON; 0: OFF
+UINT8
+Reserved — RVD
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+14/15
+
+=== PAGE 15 ===
+VIII. Register Map — Device Information Registers (Base Address: 0x1400)
+These registers provide read-only device identification and historical data.
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0000
+0
+ASCII
+16
+R
+Manufacturer Device ID — ManufacturerDeviceID
+0x0010
+16
+ASCII
+8
+R
+Hardware Version — HardwareVersion
+0x0018
+24
+ASCII
+8
+R
+Software Version — SoftwareVersion
+0x0020
+32
+UINT32 4
+R
+Cumulative Run Time — ODDRunTime
+S
+0x0024
+36
+UINT32 4
+R
+Power-On Count — PWROnTimes
+Times
+IX. Register Map — Command Registers (Base Address: 0x1600)
+These registers accept Write-Only (W) commands for calibration, control, and battery chemistry presets.
+Address
+(HEX)
+Offset
+(DEC)
+Type
+Len
+R/W
+Content (English)
+Unit
+Note
+0x0000
+0
+UINT16 4
+W
+Voltage Calibration — VoltageCalibration
+mV
+0x0004
+4
+UINT16 2
+W
+Protection Board Shutdown — Shutdown
+0x0006
+6
+UINT16 4
+W
+Current Calibration — CurrentCalibration
+mA
+0x000A
+10
+UINT16 2
+W
+One-Key Ternary Lithium-Ion Preset — LI-ION
+0x000C
+12
+UINT16 2
+W
+One-Key Lithium Iron Phosphate Preset — LiFePO4
+0x000E
+14
+UINT16 2
+W
+One-Key Lithium Titanate Preset — LTO
+0x0010
+16
+UINT16 2
+W
+Emergency Start — Emergency
+0x0012
+18
+UINT32 4
+W
+Time Calibration — TimeCalibration
+⚠ Implementation Notes for Charger Integration:
+All register offsets within a base address group are byte offsets, not Modbus register numbers. Divide byte offset
+by 2 to get the Modbus register address for 16-bit registers.
+Multi-byte values are transmitted in Big-Endian (high byte first) format as per standard Modbus convention.
+CRC checksum uses CRC-16/Modbus (polynomial 0xA001), transmitted low byte first.
+Temperature values in 0.1°C resolution: divide raw value by 10 to get degrees Celsius. Signed types (INT16/INT32)
+support negative temperatures.
+Current values (INT32 at 0x0098) are signed: positive = charge, negative = discharge.
+Always check the Alarm Status Register (0x00A0) before and during charging operations for safety-critical fault
+detection.
+JK BMS RS485 Modbus General Protocol V1.0 — English Translation
+Translated for charger-BMS communication protocol implementation
+3/18/26, 12:53 AM
+JK BMS RS485 Modbus General Protocol (V1.0)
+file:///home/ubuntu/jk_bms_translated.html
+15/15
+

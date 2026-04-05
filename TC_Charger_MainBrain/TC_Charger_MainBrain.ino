@@ -239,14 +239,33 @@ typedef enum {
 // ---- Safety FSM ----
 typedef enum {
     SAFETY_STATE_INIT = 0,
-    SAFETY_STATE_IDLE,
+    SAFETY_STATE_UNPLUGGED,     // no CAN response from charger
+    SAFETY_STATE_IDLE,          // charger connected, output disabled
     SAFETY_STATE_CHARGING,
+    SAFETY_STATE_COMPLETE,      // auto-stopped at profile target
+    SAFETY_STATE_MAINTAINING,   // battery tender mode, watching voltage
+    SAFETY_STATE_SCHEDULED,     // waiting for scheduled charge start time
     SAFETY_STATE_OVERTEMP,
     SAFETY_STATE_UNDERTEMP,
     SAFETY_STATE_BMS_FAULT,
     SAFETY_STATE_COMM_TIMEOUT,
     SAFETY_STATE_FAULT,
 } SafetyState_t;
+
+// ---- Charge profiles ----
+// Voltage-based stop points for 20S pack (adjustable per-cell voltage)
+// SOC approximations for typical Li-ion NMC:
+//   Storage ~3.80V/cell, 80% ~3.92V, 85% ~3.96V, 90% ~4.00V, 100% 4.20V
+typedef enum {
+    PROFILE_MANUAL = 0,    // no auto-stop, user controls everything
+    PROFILE_STORAGE,       // stop at storage voltage
+    PROFILE_80,            // stop at ~80% SOC
+    PROFILE_85,            // stop at ~85% SOC
+    PROFILE_90,            // stop at ~90% SOC
+    PROFILE_100,           // stop at 100% (full charge)
+    PROFILE_CUSTOM,        // user-set stop voltage
+    PROFILE_COUNT
+} ChargeProfile_t;
 
 // ---- BME280 ----
 typedef struct {
@@ -285,6 +304,7 @@ typedef struct {
 
 #define HOME_VOLTAGE_DV      840
 #define HOME_CURRENT_DA       20
+#define HOME_CELLS            20
 #define CHARGER_VOLTAGE_MAX_DV  1080
 #define CHARGER_VOLTAGE_MIN_DV   200
 #define CHARGER_CURRENT_MAX_DA   600
@@ -293,6 +313,215 @@ static uint16_t cmd_voltage_dv   = HOME_VOLTAGE_DV;
 static uint16_t cmd_current_da   = HOME_CURRENT_DA;
 static bool     cmd_charging     = false;
 static bool     cmd_buddy_mode   = false;
+static bool     cmd_charger_present = false;  // true when CAN RX is active
+
+// ---- Charge profile state ----
+static ChargeProfile_t cmd_profile = PROFILE_MANUAL;
+static uint16_t cmd_custom_stop_dv = HOME_VOLTAGE_DV;  // custom stop voltage
+
+// Per-cell voltages for each profile (multiply by HOME_CELLS for pack voltage)
+// These are adjustable -- stored in NVS
+static uint16_t profile_cell_mv[PROFILE_COUNT] = {
+    0,       // MANUAL -- no auto-stop
+    3800,    // STORAGE -- 3.80V/cell
+    3920,    // 80% -- 3.92V/cell
+    3960,    // 85% -- 3.96V/cell
+    4000,    // 90% -- 4.00V/cell
+    4200,    // 100% -- 4.20V/cell
+    0,       // CUSTOM -- uses cmd_custom_stop_dv directly
+};
+
+static const char *profile_name(ChargeProfile_t p) {
+    switch (p) {
+        case PROFILE_MANUAL:  return "MANUAL";
+        case PROFILE_STORAGE: return "STORAGE";
+        case PROFILE_80:      return "80%";
+        case PROFILE_85:      return "85%";
+        case PROFILE_90:      return "90%";
+        case PROFILE_100:     return "100%";
+        case PROFILE_CUSTOM:  return "CUSTOM";
+        default:              return "??";
+    }
+}
+
+static uint16_t profile_stop_voltage_dv(void) {
+    if (cmd_profile == PROFILE_MANUAL) return 0;  // no auto-stop
+    if (cmd_profile == PROFILE_CUSTOM) return cmd_custom_stop_dv;
+    return (uint16_t)((uint32_t)profile_cell_mv[cmd_profile] * HOME_CELLS / 100);
+}
+
+// ---- Maintenance mode (battery tender) ----
+// After reaching profile target, keep charger plugged in.
+// When voltage drops by maintain_drop_pct (default 5%), top back up.
+static bool     maintain_enabled     = false;
+static float    maintain_drop_pct    = 5.0f;   // start top-up after this % SOC drop
+static bool     maintain_waiting     = false;  // true = watching voltage, false = topping up
+static uint32_t maintain_check_ms    = 0;
+#define MAINTAIN_CHECK_INTERVAL_MS  30000UL    // check voltage every 30 seconds
+
+// Approximate SOC from voltage (20S NMC, linear approximation)
+// Full = 84.0V (4.20V/cell), Empty = 60.0V (3.00V/cell)
+static float voltage_to_soc_pct(float pack_v) {
+    float cell_v = pack_v / (float)HOME_CELLS;
+    if (cell_v >= 4.20f) return 100.0f;
+    if (cell_v <= 3.00f) return 0.0f;
+    return (cell_v - 3.00f) / (4.20f - 3.00f) * 100.0f;
+}
+
+// ---- Scheduled charging ----
+// "Be at profile X by time Y" -- firmware calculates when to start
+static bool     schedule_enabled     = false;
+static uint8_t  schedule_target_hour = 8;      // target completion hour (0-23)
+static uint8_t  schedule_target_min  = 0;      // target completion minute (0-59)
+static ChargeProfile_t schedule_profile = PROFILE_100;
+static bool     schedule_triggered   = false;  // true once auto-start fires
+static float    schedule_avg_watts   = 0.0f;   // learned average charge power
+
+// ---- Outlet presets ----
+typedef enum {
+    OUTLET_110_15A = 0,   // A: Standard US outlet
+    OUTLET_110_20A,       // B: Kitchen/garage
+    OUTLET_110_30A,       // C: Max charger on 110V
+    OUTLET_220_15A,       // D: Standard 220V
+    OUTLET_220_30A,       // E: Dryer/welder circuit
+    OUTLET_EV_STATION,    // G: EV station (user sets amps, CP bypassed w/ dummy resistor)
+    OUTLET_USER_DEFINED,  // U: User sets voltage + amps
+    OUTLET_TEST_DEV,      // F: TEST/DEV -- no limits
+    OUTLET_COUNT
+} OutletPreset_t;
+
+static OutletPreset_t outlet_preset = OUTLET_110_15A;  // default, loaded from NVS
+static uint16_t outlet_voltage_ac   = 110;   // AC voltage for user-defined
+static uint16_t outlet_amps_ac      = 15;    // AC amps for user-defined / EV station
+
+static uint16_t outlet_max_watts(void) {
+    switch (outlet_preset) {
+        case OUTLET_110_15A:     return 1650;
+        case OUTLET_110_20A:     return 2200;
+        case OUTLET_110_30A:     return 3300;
+        case OUTLET_220_15A:     return 3300;
+        case OUTLET_220_30A:     return 6600;
+        case OUTLET_EV_STATION:  return (uint16_t)(220 * outlet_amps_ac);
+        case OUTLET_USER_DEFINED: return (uint16_t)(outlet_voltage_ac * outlet_amps_ac);
+        case OUTLET_TEST_DEV:    return 0;  // 0 = no limit
+        default:                 return 1650;
+    }
+}
+
+static const char *outlet_name(void) {
+    switch (outlet_preset) {
+        case OUTLET_110_15A:      return "110V/15A";
+        case OUTLET_110_20A:      return "110V/20A";
+        case OUTLET_110_30A:      return "110V/30A";
+        case OUTLET_220_15A:      return "220V/15A";
+        case OUTLET_220_30A:      return "220V/30A";
+        case OUTLET_EV_STATION:   return "EV Station";
+        case OUTLET_USER_DEFINED: return "User Def";
+        case OUTLET_TEST_DEV:     return "TEST/DEV";
+        default:                  return "??";
+    }
+}
+
+// Clamp charge current to outlet power limit
+static uint16_t outlet_clamp_current_da(uint16_t requested_da) {
+    uint16_t max_w = outlet_max_watts();
+    if (max_w == 0) return requested_da;  // TEST/DEV, no limit
+    float max_a = (float)max_w / (cmd_voltage_dv * 0.1f);
+    uint16_t max_da = (uint16_t)(max_a * 10.0f);
+    return (requested_da < max_da) ? requested_da : max_da;
+}
+
+// ---- TEST/DEV mode ----
+static bool test_dev_mode = false;  // follows OUTLET_TEST_DEV selection
+
+// ---- Thermal zones (battery temps only, charger temp excluded) ----
+// Temps in Fahrenheit, adjustable, saved to NVS
+static float tz_normal_max_f   = 140.0f;  // below = full rate (20-60C)
+static float tz_caution_max_f  = 194.0f;  // 60-90C: degradation onset, puffing
+static float tz_danger_max_f   = 248.0f;  // 90-120C: cell damage, heavy derate
+                                           // above danger = CRITICAL: immediate shutdown
+
+// Derating: linear reduction through CAUTION and DANGER zones
+// Returns multiplier 0.0 to 1.0
+static float thermal_zone_multiplier(float max_temp_f) {
+    if (test_dev_mode) return 1.0f;  // TEST/DEV disables thermal
+    if (max_temp_f < 32.0f) return 0.0f;  // below freezing, no charge
+    if (max_temp_f <= tz_normal_max_f) return 1.0f;  // full rate
+    if (max_temp_f >= tz_danger_max_f) return 0.0f;  // CRITICAL shutdown
+    if (max_temp_f <= tz_caution_max_f) {
+        // CAUTION: linear derate from 100% to 50%
+        float pct = (max_temp_f - tz_normal_max_f) / (tz_caution_max_f - tz_normal_max_f);
+        return 1.0f - pct * 0.5f;
+    }
+    // DANGER: linear derate from 50% to 0%
+    float pct = (max_temp_f - tz_caution_max_f) / (tz_danger_max_f - tz_caution_max_f);
+    return 0.5f - pct * 0.5f;
+}
+
+static const char *thermal_zone_name(float max_temp_f) {
+    if (max_temp_f < 32.0f) return "FREEZE";
+    if (max_temp_f <= tz_normal_max_f) return "NORMAL";
+    if (max_temp_f <= tz_caution_max_f) return "CAUTION";
+    if (max_temp_f <= tz_danger_max_f) return "DANGER";
+    return "CRITICAL";
+}
+
+// ---- Per-sensor enable/disable + calibration ----
+// NTC T1-T5 (indices 1-5, index 0 unused on C3 Super Mini)
+static bool  sensor_ntc_enabled[6]  = {false, true, true, true, true, true};
+static float sensor_ntc_offset_f[6] = {0, 0, 0, 0, 0, 0};  // calibration offset in F
+
+// BMS temps
+static bool  sensor_bms1_enabled = true;
+static bool  sensor_bms2_enabled = true;
+static float sensor_bms1_offset_f = 0.0f;
+static float sensor_bms2_offset_f = 0.0f;
+
+// Get highest enabled battery temperature (F). Returns -999 if none available.
+static float get_max_battery_temp_f(void) {
+    float mx = -999.0f;
+
+    // NTC sensors from Temp Node
+    TempNodeData_t td;
+    if (rs485_get_last_temp_node(&td)) {
+        for (int i = 1; i <= 5; i++) {
+            if (sensor_ntc_enabled[i] && (td.valid_mask & (1 << i))) {
+                float tf = td.temp_c[i] * 9.0f / 5.0f + 32.0f + sensor_ntc_offset_f[i];
+                if (tf > mx) mx = tf;
+            }
+        }
+    }
+
+    // BMS temps
+    BMSData_t bms;
+    if (rs485_get_last_bms(&bms) && bms.valid) {
+        if (sensor_bms1_enabled) {
+            float tf = (bms.bat_temp1_dc / 10.0f) * 9.0f / 5.0f + 32.0f + sensor_bms1_offset_f;
+            if (tf > mx) mx = tf;
+        }
+        if (sensor_bms2_enabled) {
+            float tf = (bms.bat_temp2_dc / 10.0f) * 9.0f / 5.0f + 32.0f + sensor_bms2_offset_f;
+            if (tf > mx) mx = tf;
+        }
+    }
+
+    return mx;
+}
+
+// ---- Input power tracking ----
+static float    input_peak_watts     = 0.0f;
+
+// ---- Time source ----
+static bool     time_valid           = false;
+static uint8_t  time_hour            = 0;
+static uint8_t  time_minute          = 0;
+static uint32_t time_update_ms       = 0;
+
+// ---- Multi-char command buffer ----
+#define CMD_BUF_SIZE 32
+static char  cmd_buf[CMD_BUF_SIZE];
+static uint8_t cmd_buf_len = 0;
+static bool    cmd_buf_active = false;  // true when collecting multi-char command
 
 // =============================================================================
 //  FORWARD DECLARATIONS
@@ -508,18 +737,11 @@ void can_driver_init(void) {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         (gpio_num_t)CAN_TX_GPIO, (gpio_num_t)CAN_RX_GPIO, TWAI_MODE_NORMAL);
     twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_250KBITS();
-    twai_filter_config_t  f_config;
-    f_config.acceptance_code = (CAN_CHARGER_RX_ID << 3);
-    f_config.acceptance_mask = ~((CAN_CHARGER_RX_ID << 3));
-    f_config.single_filter   = true;
+    // Accept all frames -- we process charger, emergency, and inter-module IDs
+    twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     esp_err_t err;
     err = twai_driver_install(&g_config, &t_config, &f_config);
-    if (err != ESP_OK) {
-        Serial.printf("[CAN] install error %d, using accept-all filter\n", err);
-        twai_filter_config_t f_all = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-        err = twai_driver_install(&g_config, &t_config, &f_all);
-    }
     if (err != ESP_OK) { Serial.printf("[CAN] driver install failed: %d\n", err); return; }
 
     err = twai_start();
@@ -568,8 +790,18 @@ void can_driver_update(void) {
 
     twai_message_t msg;
     while (twai_receive(&msg, 0) == ESP_OK) {
-        if (msg.extd && msg.identifier == CAN_CHARGER_RX_ID) {
+        if (!msg.extd) continue;
+        if (msg.identifier == CAN_CHARGER_RX_ID) {
             parse_rx_frame(&msg);
+        } else if (msg.identifier == CAN_EMERGENCY_STOP_ID) {
+            cmd_charging = false;
+            nrg_active = false;
+            can_send_disable();
+            safety_state = SAFETY_STATE_FAULT;
+            rgb_led_set_state(RGB_STATE_FAULT);
+            Serial.println("[CAN] *** EMERGENCY STOP ***");
+        } else if (msg.identifier == CAN_INTERMOD_CMD_ID) {
+            can_process_intermod(&msg);
         }
     }
 }
@@ -1202,8 +1434,12 @@ static SafetyState_t safety_state = SAFETY_STATE_INIT;
 const char *safety_state_name(SafetyState_t s) {
     switch (s) {
         case SAFETY_STATE_INIT:         return "INIT";
-        case SAFETY_STATE_IDLE:         return "IDLE";
+        case SAFETY_STATE_UNPLUGGED:    return "UNPLUGGED";
+        case SAFETY_STATE_IDLE:         return "READY";
         case SAFETY_STATE_CHARGING:     return "CHARGING";
+        case SAFETY_STATE_COMPLETE:     return "COMPLETE";
+        case SAFETY_STATE_MAINTAINING:  return "MAINTAIN";
+        case SAFETY_STATE_SCHEDULED:    return "SCHEDULED";
         case SAFETY_STATE_OVERTEMP:     return "OVER TEMP";
         case SAFETY_STATE_UNDERTEMP:    return "UNDER TEMP";
         case SAFETY_STATE_BMS_FAULT:    return "BMS FAULT";
@@ -1215,7 +1451,11 @@ const char *safety_state_name(SafetyState_t s) {
 
 static RGBState_t safety_to_rgb(SafetyState_t s) {
     switch (s) {
-        case SAFETY_STATE_CHARGING:     return RGB_STATE_CHARGING;
+        case SAFETY_STATE_UNPLUGGED:    return RGB_STATE_BOOT;        // white slow blink
+        case SAFETY_STATE_CHARGING:     return RGB_STATE_CHARGING;    // green solid
+        case SAFETY_STATE_COMPLETE:     return RGB_STATE_IDLE;        // blue slow blink
+        case SAFETY_STATE_MAINTAINING:  return RGB_STATE_IDLE;        // blue slow blink
+        case SAFETY_STATE_SCHEDULED:    return RGB_STATE_COMM_TIMEOUT; // yellow blink
         case SAFETY_STATE_OVERTEMP:     return RGB_STATE_OVERTEMP;
         case SAFETY_STATE_UNDERTEMP:    return RGB_STATE_UNDERTEMP;
         case SAFETY_STATE_BMS_FAULT:    return RGB_STATE_BMS_FAULT;
@@ -1475,8 +1715,12 @@ static bool     oled_held         = false;
 static const char *oled_state_label(SafetyState_t s) {
     switch (s) {
         case SAFETY_STATE_INIT:         return "INIT";
-        case SAFETY_STATE_IDLE:         return "IDLE";
+        case SAFETY_STATE_UNPLUGGED:    return "UNPLUGGED";
+        case SAFETY_STATE_IDLE:         return "READY";
         case SAFETY_STATE_CHARGING:     return "CHARGING";
+        case SAFETY_STATE_COMPLETE:     return "COMPLETE";
+        case SAFETY_STATE_MAINTAINING:  return "MAINTAIN";
+        case SAFETY_STATE_SCHEDULED:    return "SCHEDULED";
         case SAFETY_STATE_OVERTEMP:     return "OVER TEMP";
         case SAFETY_STATE_UNDERTEMP:    return "UNDER TEMP";
         case SAFETY_STATE_BMS_FAULT:    return "BMS FAULT";
@@ -1903,14 +2147,171 @@ static uint32_t cmd_status_ms    = 0;
 // safety_sm_update() -- display-only, defined here because it uses cmd_charging
 void safety_sm_update(void) {
     SafetyState_t prev = safety_state;
+    uint32_t now = millis();
 
-    if (cmd_charging) {
-        safety_state = SAFETY_STATE_CHARGING;
+    // Detect charger presence from CAN RX
+    ChargerStatus_t cs;
+    cmd_charger_present = can_read_status(&cs);
+
+    // Track peak power for input voltage detection
+    if (cmd_charger_present && cmd_charging) {
+        float pw = can_smooth_voltage * can_smooth_current;
+        if (pw > input_peak_watts) input_peak_watts = pw;
+        // Update average watts for schedule calculation
+        if (schedule_avg_watts < 1.0f) schedule_avg_watts = pw;
+        else schedule_avg_watts += 0.05f * (pw - schedule_avg_watts);
+    }
+
+    // Update time from GPS
+    if (now - time_update_ms > 10000UL) {
+        time_update_ms = now;
+        GPSData_t gps;
+        if (gps_driver_get(&gps) && gps.gps_valid) {
+            // GPS time comes from TinyGPSPlus -- check if time is valid
+            if (gps_parser.time.isValid()) {
+                time_hour   = gps_parser.time.hour();
+                time_minute = gps_parser.time.minute();
+                time_valid  = true;
+            }
+        }
+    }
+
+    if (!cmd_charger_present) {
+        safety_state = SAFETY_STATE_UNPLUGGED;
+
+    } else if (cmd_charging) {
+        // Check auto-stop: has pack reached profile target voltage?
+        uint16_t stop_dv = profile_stop_voltage_dv();
+        if (!test_dev_mode && stop_dv > 0 && can_smooth_voltage >= (stop_dv * 0.1f)) {
+            cmd_charging = false;
+            nrg_active = false;
+            can_send_disable();
+            safety_state = SAFETY_STATE_COMPLETE;
+            float miles = (cmd_buddy_mode ? nrg_buddy_wh : nrg_session_wh) / range_wh_per_mile;
+            Serial.printf("[AUTO] Charge complete at %.1fV (profile: %s, target: %.1fV)\n",
+                          can_smooth_voltage, profile_name(cmd_profile), stop_dv * 0.1f);
+            Serial.printf("[AUTO] Session: %.1fWh / %.2fAh (+%.1f mi)\n",
+                          cmd_buddy_mode ? nrg_buddy_wh : nrg_session_wh,
+                          cmd_buddy_mode ? nrg_buddy_ah : nrg_session_ah, miles);
+            if (maintain_enabled) {
+                maintain_waiting = true;
+                maintain_check_ms = now;
+                Serial.println("[MAINTAIN] Entering maintenance mode -- monitoring voltage");
+            }
+        } else {
+            safety_state = SAFETY_STATE_CHARGING;
+
+            // Thermal zone enforcement (skipped in TEST/DEV)
+            float max_batt_f = get_max_battery_temp_f();
+            if (!test_dev_mode && max_batt_f > -900.0f) {
+                float mult = thermal_zone_multiplier(max_batt_f);
+                if (mult <= 0.0f) {
+                    // CRITICAL or FREEZE -- immediate shutdown
+                    cmd_charging = false;
+                    nrg_active = false;
+                    can_send_disable();
+                    safety_state = SAFETY_STATE_FAULT;
+                    Serial.printf("[THERMAL] %s at %.0fF -- SHUTDOWN\n",
+                                  thermal_zone_name(max_batt_f), max_batt_f);
+                } else if (mult < 1.0f) {
+                    // CAUTION or DANGER -- derate current
+                    uint16_t derated_da = (uint16_t)(cmd_current_da * mult);
+                    uint16_t clamped_da = outlet_clamp_current_da(derated_da);
+                    ChargerCmd_t cmd;
+                    cmd.voltage_dv = cmd_voltage_dv;
+                    cmd.current_da = clamped_da;
+                    cmd.control    = CAN_CTRL_CHARGE;
+                    cmd.mode       = CAN_MODE_CHARGE;
+                    can_send_command(&cmd);
+                } else {
+                    // NORMAL -- full rate, clamp to outlet
+                    uint16_t clamped_da = outlet_clamp_current_da(cmd_current_da);
+                    ChargerCmd_t cmd;
+                    cmd.voltage_dv = cmd_voltage_dv;
+                    cmd.current_da = clamped_da;
+                    cmd.control    = CAN_CTRL_CHARGE;
+                    cmd.mode       = CAN_MODE_CHARGE;
+                    can_send_command(&cmd);
+                }
+            }
+        }
+
+    } else if (maintain_enabled && maintain_waiting &&
+               (safety_state == SAFETY_STATE_COMPLETE || safety_state == SAFETY_STATE_MAINTAINING)) {
+        // Maintenance mode: check voltage periodically
+        safety_state = SAFETY_STATE_MAINTAINING;
+        if ((now - maintain_check_ms) >= MAINTAIN_CHECK_INTERVAL_MS) {
+            maintain_check_ms = now;
+            // Check if voltage has dropped enough to warrant top-up
+            uint16_t stop_dv = profile_stop_voltage_dv();
+            if (stop_dv > 0) {
+                float target_v = stop_dv * 0.1f;
+                float current_soc = voltage_to_soc_pct(can_smooth_voltage);
+                float target_soc  = voltage_to_soc_pct(target_v);
+                float drop = target_soc - current_soc;
+
+                if (drop >= maintain_drop_pct) {
+                    // SOC has dropped enough -- start top-up
+                    Serial.printf("[MAINTAIN] SOC dropped %.1f%% (%.1fV -> need %.1fV) -- topping up\n",
+                                  drop, can_smooth_voltage, target_v);
+                    cmd_charging = true;
+                    nrg_active = true;
+                    nrg_last_ms = now;
+                    cmd_send_now();
+                    safety_state = SAFETY_STATE_CHARGING;
+                    maintain_waiting = false;
+                }
+            }
+        }
+
+    } else if (schedule_enabled && !schedule_triggered && time_valid &&
+               safety_state != SAFETY_STATE_CHARGING) {
+        // Scheduled charge: calculate if it's time to start
+        safety_state = SAFETY_STATE_SCHEDULED;
+        uint16_t stop_dv = profile_stop_voltage_dv();
+        if (stop_dv > 0 && schedule_avg_watts > 100.0f) {
+            float target_v = stop_dv * 0.1f;
+            float current_v = can_smooth_voltage;
+            // Estimate Wh needed: rough approximation
+            float wh_needed = (target_v - current_v) * cmd_current_da * 0.1f * 0.5f;
+            if (wh_needed < 0) wh_needed = 0;
+            float hours_needed = wh_needed / schedule_avg_watts;
+            if (hours_needed < 0.1f) hours_needed = 0.1f;
+
+            // Calculate start time
+            int target_mins = schedule_target_hour * 60 + schedule_target_min;
+            int start_mins = target_mins - (int)(hours_needed * 60.0f);
+            if (start_mins < 0) start_mins += 1440;  // wrap past midnight
+
+            int now_mins = time_hour * 60 + time_minute;
+
+            // Check if it's time to start (within 2-minute window)
+            int diff = now_mins - start_mins;
+            if (diff < 0) diff += 1440;
+            if (diff >= 0 && diff <= 2) {
+                schedule_triggered = true;
+                cmd_charging = true;
+                nrg_active = true;
+                nrg_last_ms = now;
+                cmd_send_now();
+                Serial.printf("[SCHEDULE] Starting charge now -- target %02d:%02d, est %.1f hrs needed\n",
+                              schedule_target_hour, schedule_target_min, hours_needed);
+                safety_state = SAFETY_STATE_CHARGING;
+            }
+        }
+
+    } else if (safety_state == SAFETY_STATE_COMPLETE || safety_state == SAFETY_STATE_MAINTAINING) {
+        // Stay in current state until user acts
     } else {
         safety_state = SAFETY_STATE_IDLE;
     }
 
     if (safety_state != prev) {
+        if (prev == SAFETY_STATE_UNPLUGGED && safety_state != SAFETY_STATE_UNPLUGGED) {
+            Serial.println("[CHARGER] Connected -- CAN communication established");
+        } else if (safety_state == SAFETY_STATE_UNPLUGGED && prev != SAFETY_STATE_UNPLUGGED) {
+            Serial.println("[CHARGER] Unplugged -- no CAN response");
+        }
         rgb_led_set_state(safety_to_rgb(safety_state));
     }
 }
@@ -1926,8 +2327,27 @@ static void cmd_print_help(void) {
     Serial.println("  -  - Current -1A");
     Serial.println("  v  - Voltage +0.5V");
     Serial.println("  V  - Voltage -0.5V");
+    Serial.println("  m  - Toggle MAINTAIN mode (battery tender)");
+    Serial.println("  t  - Toggle SCHEDULE charge (be ready by time)");
     Serial.println("  b  - Enter BUDDY mode (charge another battery)");
     Serial.println("  n  - Exit buddy mode, restore home settings");
+    Serial.println("  --- Profiles (auto-stop at target voltage) ---");
+    Serial.println("  1  - MANUAL (no auto-stop)");
+    Serial.printf( "  2  - STORAGE (%.1fV, %.3fV/cell)\n",
+                   (float)(profile_cell_mv[PROFILE_STORAGE] * HOME_CELLS) / 1000.0f,
+                   profile_cell_mv[PROFILE_STORAGE] / 1000.0f);
+    Serial.printf( "  3  - 80%%  (%.1fV, %.3fV/cell)\n",
+                   (float)(profile_cell_mv[PROFILE_80] * HOME_CELLS) / 1000.0f,
+                   profile_cell_mv[PROFILE_80] / 1000.0f);
+    Serial.printf( "  4  - 85%%  (%.1fV, %.3fV/cell)\n",
+                   (float)(profile_cell_mv[PROFILE_85] * HOME_CELLS) / 1000.0f,
+                   profile_cell_mv[PROFILE_85] / 1000.0f);
+    Serial.printf( "  5  - 90%%  (%.1fV, %.3fV/cell)\n",
+                   (float)(profile_cell_mv[PROFILE_90] * HOME_CELLS) / 1000.0f,
+                   profile_cell_mv[PROFILE_90] / 1000.0f);
+    Serial.printf( "  6  - 100%% (%.1fV, %.3fV/cell)\n",
+                   (float)(profile_cell_mv[PROFILE_100] * HOME_CELLS) / 1000.0f,
+                   profile_cell_mv[PROFILE_100] / 1000.0f);
     Serial.println("  0  - Reset energy counters (Wh/Ah) to zero");
     Serial.println("  p  - Print full status report");
     Serial.println("  ?  - Show this help");
@@ -1938,6 +2358,18 @@ static void cmd_print_help(void) {
                    CHARGER_VOLTAGE_MIN_DV * 0.1f,
                    CHARGER_VOLTAGE_MAX_DV * 0.1f,
                    CHARGER_CURRENT_MAX_DA * 0.1f);
+    Serial.println("  --- Multi-char cmds (type then Enter) ---");
+    Serial.println("  OA-OE - Outlet presets (110/15,20,30 220/15,30)");
+    Serial.println("  OG24  - EV Station @ 24A (set your station amps)");
+    Serial.println("  OU110,20 - User defined: voltage,amps");
+    Serial.println("  OF    - TEST/DEV mode (all safety off)");
+    Serial.println("  TZ1,140 - Set CAUTION temp threshold (F)");
+    Serial.println("  TZ2,194 - Set DANGER temp threshold (F)");
+    Serial.println("  TZ3,248 - Set CRITICAL temp threshold (F)");
+    Serial.println("  TS1,0   - Disable NTC T1 (TS1-TS5)");
+    Serial.println("  TSB1,0  - Disable BMS Temp1 (TSB1,TSB2)");
+    Serial.println("  TC1,-2.0 - Calibrate NTC T1 offset (F)");
+    Serial.println("  TCB1,1.5 - Calibrate BMS Temp1 offset (F)");
     Serial.println("========================================");
     Serial.println();
 }
@@ -1947,7 +2379,17 @@ static void cmd_print_status(void) {
     Serial.println("------------ Status Report ------------");
 
     // Mode
+    Serial.printf("  State:     %s\n", safety_state_name(safety_state));
     Serial.printf("  Mode:      %s\n", cmd_buddy_mode ? "BUDDY (external battery)" : "NORMAL (home 20S pack)");
+
+    // Profile
+    uint16_t stop_dv = profile_stop_voltage_dv();
+    if (stop_dv > 0) {
+        Serial.printf("  Profile:   %s -- auto-stop at %.1fV\n",
+                      profile_name(cmd_profile), stop_dv * 0.1f);
+    } else {
+        Serial.printf("  Profile:   %s -- no auto-stop\n", profile_name(cmd_profile));
+    }
 
     // Setpoints
     float set_v = cmd_voltage_dv * 0.1f;
@@ -2064,19 +2506,60 @@ static void cmd_print_status(void) {
         Serial.println("  Start charging to see time-to-range estimates");
     }
 
+    // Maintain & Schedule
+    Serial.println("  ---- Modes ----");
+    Serial.printf("  Maintain:  %s", maintain_enabled ? "ON" : "OFF");
+    if (maintain_enabled)
+        Serial.printf(" (top up after %.0f%% drop, %s)\n",
+                      maintain_drop_pct,
+                      maintain_waiting ? "WATCHING" : "inactive");
+    else Serial.println();
+
+    Serial.printf("  Schedule:  %s", schedule_enabled ? "ON" : "OFF");
+    if (schedule_enabled)
+        Serial.printf(" (%s by %02d:%02d, %s)\n",
+                      profile_name(cmd_profile),
+                      schedule_target_hour, schedule_target_min,
+                      schedule_triggered ? "TRIGGERED" : "waiting");
+    else Serial.println();
+
+    Serial.printf("  Outlet:    %s (max %uW)\n", outlet_name(), outlet_max_watts());
+    Serial.printf("  Peak seen: %.0fW\n", input_peak_watts);
+
+    // Battery temperature
+    float max_batt_f = get_max_battery_temp_f();
+    if (max_batt_f > -900.0f) {
+        Serial.printf("  Batt temp: %.0fF [%s] derate:%.0f%%\n",
+                      max_batt_f, thermal_zone_name(max_batt_f),
+                      thermal_zone_multiplier(max_batt_f) * 100.0f);
+    } else {
+        Serial.println("  Batt temp: No sensors connected");
+    }
+    Serial.printf("  Zones:     NORMAL<%.0fF CAUTION<%.0fF DANGER<%.0fF\n",
+                  tz_normal_max_f, tz_caution_max_f, tz_danger_max_f);
+
+    if (time_valid)
+        Serial.printf("  Time:      %02d:%02d (GPS)\n", time_hour, time_minute);
+    else
+        Serial.println("  Time:      No fix (waiting for GPS or app sync)");
+
     Serial.println("---------------------------------------");
     Serial.println();
 }
 
 static void cmd_send_now(void) {
-    // Send current setpoints to charger immediately
     if (cmd_charging) {
+        uint16_t clamped_da = outlet_clamp_current_da(cmd_current_da);
         ChargerCmd_t cmd;
         cmd.voltage_dv = cmd_voltage_dv;
-        cmd.current_da = cmd_current_da;
+        cmd.current_da = clamped_da;
         cmd.control    = CAN_CTRL_CHARGE;
         cmd.mode       = CAN_MODE_CHARGE;
         can_send_command(&cmd);
+        if (clamped_da < cmd_current_da) {
+            Serial.printf("  ** Clamped to %.1fA by %s outlet (%uW max)\n",
+                          clamped_da * 0.1f, outlet_name(), outlet_max_watts());
+        }
     } else {
         can_send_disable();
     }
@@ -2099,8 +2582,11 @@ static void serial_command_update(void) {
         ChargerStatus_t cs;
         bool has_rx = can_read_status(&cs);
 
-        Serial.printf("[STATUS] %s | Set:%.1fV/%.1fA %s | ",
+        const char *st_name = safety_state_name(safety_state);
+        Serial.printf("[STATUS] %s%s %s | Set:%.1fV/%.1fA %s | ",
+                      test_dev_mode ? "[DEV] " : "",
                       cmd_buddy_mode ? "BUDDY" : "HOME",
+                      st_name,
                       cmd_voltage_dv * 0.1f,
                       cmd_current_da * 0.1f,
                       cmd_charging ? "ON" : "OFF");
@@ -2148,8 +2634,163 @@ static void serial_command_update(void) {
     }
 }
 
+// ---- Multi-char command executor ----
+static void cmd_execute_multi(const char *buf, uint8_t len) {
+    // Outlet presets: OA, OB, OC, OD, OE, OF, OG24, OU110,20
+    if (buf[0] == 'O' && len >= 2) {
+        switch (buf[1]) {
+            case 'A': outlet_preset = OUTLET_110_15A; test_dev_mode = false; break;
+            case 'B': outlet_preset = OUTLET_110_20A; test_dev_mode = false; break;
+            case 'C': outlet_preset = OUTLET_110_30A; test_dev_mode = false; break;
+            case 'D': outlet_preset = OUTLET_220_15A; test_dev_mode = false; break;
+            case 'E': outlet_preset = OUTLET_220_30A; test_dev_mode = false; break;
+            case 'F':
+                outlet_preset = OUTLET_TEST_DEV;
+                test_dev_mode = true;
+                Serial.println("[DEV] TEST/DEV MODE -- ALL SAFETY DISABLED");
+                break;
+            case 'G':
+                outlet_preset = OUTLET_EV_STATION;
+                test_dev_mode = false;
+                if (len > 2) outlet_amps_ac = (uint16_t)atoi(&buf[2]);
+                Serial.printf("[OUTLET] EV Station @ %uA (max %uW)\n",
+                              outlet_amps_ac, outlet_max_watts());
+                return;
+            case 'U':
+                outlet_preset = OUTLET_USER_DEFINED;
+                test_dev_mode = false;
+                // Parse: OU110,20 or OU220,25
+                if (len > 2) {
+                    const char *comma = strchr(&buf[2], ',');
+                    if (comma) {
+                        outlet_voltage_ac = (uint16_t)atoi(&buf[2]);
+                        outlet_amps_ac = (uint16_t)atoi(comma + 1);
+                    }
+                }
+                Serial.printf("[OUTLET] User: %uV / %uA (max %uW)\n",
+                              outlet_voltage_ac, outlet_amps_ac, outlet_max_watts());
+                return;
+            default:
+                Serial.printf("[CMD] Unknown outlet: O%c\n", buf[1]);
+                return;
+        }
+        Serial.printf("[OUTLET] %s (max %uW)\n", outlet_name(), outlet_max_watts());
+        nrg_prefs.putUChar("outlet", (uint8_t)outlet_preset);
+        nrg_prefs.putUShort("outlet_v", outlet_voltage_ac);
+        nrg_prefs.putUShort("outlet_a", outlet_amps_ac);
+        return;
+    }
+
+    // Thermal zone thresholds: TZ1,140  TZ2,194  TZ3,248
+    if (buf[0] == 'T' && buf[1] == 'Z' && len >= 4) {
+        const char *comma = strchr(&buf[2], ',');
+        if (comma) {
+            int zone = buf[2] - '0';
+            float val = atof(comma + 1);
+            switch (zone) {
+                case 1: tz_normal_max_f = val;
+                    Serial.printf("[THERMAL] CAUTION starts at %.0fF\n", val); break;
+                case 2: tz_caution_max_f = val;
+                    Serial.printf("[THERMAL] DANGER starts at %.0fF\n", val); break;
+                case 3: tz_danger_max_f = val;
+                    Serial.printf("[THERMAL] CRITICAL starts at %.0fF\n", val); break;
+                default: Serial.println("[CMD] Zone must be 1, 2, or 3"); return;
+            }
+            nrg_prefs.putFloat("tz1", tz_normal_max_f);
+            nrg_prefs.putFloat("tz2", tz_caution_max_f);
+            nrg_prefs.putFloat("tz3", tz_danger_max_f);
+        }
+        return;
+    }
+
+    // Sensor enable/disable: TS1,0  TS3,1  TSB1,0  TSB2,1
+    if (buf[0] == 'T' && buf[1] == 'S' && len >= 4) {
+        if (buf[2] == 'B' && len >= 5) {
+            // BMS temp: TSB1,0 or TSB2,1
+            const char *comma = strchr(&buf[3], ',');
+            if (comma) {
+                int idx = buf[3] - '0';
+                bool en = (atoi(comma + 1) != 0);
+                if (idx == 1) { sensor_bms1_enabled = en;
+                    Serial.printf("[SENSOR] BMS Temp1 %s\n", en ? "ENABLED" : "DISABLED"); }
+                else if (idx == 2) { sensor_bms2_enabled = en;
+                    Serial.printf("[SENSOR] BMS Temp2 %s\n", en ? "ENABLED" : "DISABLED"); }
+            }
+        } else {
+            // NTC: TS1,0 or TS5,1
+            const char *comma = strchr(&buf[2], ',');
+            if (comma) {
+                int idx = buf[2] - '0';
+                bool en = (atoi(comma + 1) != 0);
+                if (idx >= 1 && idx <= 5) {
+                    sensor_ntc_enabled[idx] = en;
+                    Serial.printf("[SENSOR] NTC T%d %s\n", idx, en ? "ENABLED" : "DISABLED");
+                }
+            }
+        }
+        return;
+    }
+
+    // Calibration offset: TC1,-2.0  TC3,1.5  TCB1,-3.0  TCB2,0
+    if (buf[0] == 'T' && buf[1] == 'C' && len >= 4) {
+        if (buf[2] == 'B' && len >= 5) {
+            const char *comma = strchr(&buf[3], ',');
+            if (comma) {
+                int idx = buf[3] - '0';
+                float offset = atof(comma + 1);
+                if (idx == 1) { sensor_bms1_offset_f = offset;
+                    Serial.printf("[CAL] BMS Temp1 offset: %+.1fF\n", offset); }
+                else if (idx == 2) { sensor_bms2_offset_f = offset;
+                    Serial.printf("[CAL] BMS Temp2 offset: %+.1fF\n", offset); }
+                nrg_prefs.putFloat("calb1", sensor_bms1_offset_f);
+                nrg_prefs.putFloat("calb2", sensor_bms2_offset_f);
+            }
+        } else {
+            const char *comma = strchr(&buf[2], ',');
+            if (comma) {
+                int idx = buf[2] - '0';
+                float offset = atof(comma + 1);
+                if (idx >= 1 && idx <= 5) {
+                    sensor_ntc_offset_f[idx] = offset;
+                    Serial.printf("[CAL] NTC T%d offset: %+.1fF\n", idx, offset);
+                    char key[8];
+                    snprintf(key, sizeof(key), "cal%d", idx);
+                    nrg_prefs.putFloat(key, offset);
+                }
+            }
+        }
+        return;
+    }
+
+    Serial.printf("[CMD] Unknown multi-char: %s\n", buf);
+}
+
 // Shared command processor -- called from Serial, BLE, and WiFi
 static void cmd_process_char(char c) {
+        // Multi-char command buffering: starts with O, T (when followed by Z/S/C)
+        // Enter key or semicolon executes the buffer
+        if (cmd_buf_active) {
+            if (c == '\r' || c == '\n' || c == ';') {
+                cmd_buf[cmd_buf_len] = '\0';
+                if (cmd_buf_len > 0) cmd_execute_multi(cmd_buf, cmd_buf_len);
+                cmd_buf_len = 0;
+                cmd_buf_active = false;
+                return;
+            }
+            if (cmd_buf_len < CMD_BUF_SIZE - 1) {
+                cmd_buf[cmd_buf_len++] = c;
+            }
+            return;
+        }
+
+        // Check if this char starts a multi-char command
+        if (c == 'O') {
+            cmd_buf_active = true;
+            cmd_buf_len = 0;
+            cmd_buf[cmd_buf_len++] = c;
+            return;
+        }
+
         switch (c) {
 
             // ---- Charge control ----
@@ -2336,6 +2977,78 @@ static void cmd_process_char(char c) {
                 }
                 break;
 
+            // ---- Maintain mode ----
+            case 'm':
+                maintain_enabled = !maintain_enabled;
+                if (maintain_enabled) {
+                    maintain_waiting = false;
+                    Serial.printf("[CMD] MAINTAIN mode ON -- will top up after %.0f%% SOC drop\n",
+                                  maintain_drop_pct);
+                    Serial.println("       Charge to profile target first, then leave plugged in.");
+                } else {
+                    maintain_waiting = false;
+                    Serial.println("[CMD] MAINTAIN mode OFF");
+                }
+                break;
+
+            // ---- Schedule charge ----
+            case 't':
+                if (!schedule_enabled) {
+                    schedule_enabled = true;
+                    schedule_triggered = false;
+                    uint16_t stop_dv = profile_stop_voltage_dv();
+                    Serial.printf("[CMD] SCHEDULE ON -- target %s by %02d:%02d\n",
+                                  profile_name(cmd_profile == PROFILE_MANUAL ? PROFILE_100 : cmd_profile),
+                                  schedule_target_hour, schedule_target_min);
+                    if (cmd_profile == PROFILE_MANUAL) {
+                        cmd_profile = PROFILE_100;
+                        Serial.println("       Profile set to 100% (was MANUAL)");
+                    }
+                    if (stop_dv > 0)
+                        Serial.printf("       Stop voltage: %.1fV\n", stop_dv * 0.1f);
+                    if (time_valid)
+                        Serial.printf("       Current time: %02d:%02d (from GPS)\n", time_hour, time_minute);
+                    else
+                        Serial.println("       WARNING: No time source yet (waiting for GPS fix)");
+                    Serial.println("       Set time with WiFi: /cmd?c=T0800 (for 08:00)");
+                } else {
+                    schedule_enabled = false;
+                    schedule_triggered = false;
+                    Serial.println("[CMD] SCHEDULE OFF");
+                }
+                break;
+
+            // ---- Charge profiles (1-6) ----
+            case '1':
+                cmd_profile = PROFILE_MANUAL;
+                Serial.println("[PROFILE] MANUAL -- no auto-stop, you control everything");
+                break;
+            case '2':
+                cmd_profile = PROFILE_STORAGE;
+                Serial.printf("[PROFILE] STORAGE -- auto-stop at %.1fV (%.3fV/cell)\n",
+                              profile_stop_voltage_dv() * 0.1f, profile_cell_mv[PROFILE_STORAGE] / 1000.0f);
+                break;
+            case '3':
+                cmd_profile = PROFILE_80;
+                Serial.printf("[PROFILE] 80%% -- auto-stop at %.1fV (%.3fV/cell)\n",
+                              profile_stop_voltage_dv() * 0.1f, profile_cell_mv[PROFILE_80] / 1000.0f);
+                break;
+            case '4':
+                cmd_profile = PROFILE_85;
+                Serial.printf("[PROFILE] 85%% -- auto-stop at %.1fV (%.3fV/cell)\n",
+                              profile_stop_voltage_dv() * 0.1f, profile_cell_mv[PROFILE_85] / 1000.0f);
+                break;
+            case '5':
+                cmd_profile = PROFILE_90;
+                Serial.printf("[PROFILE] 90%% -- auto-stop at %.1fV (%.3fV/cell)\n",
+                              profile_stop_voltage_dv() * 0.1f, profile_cell_mv[PROFILE_90] / 1000.0f);
+                break;
+            case '6':
+                cmd_profile = PROFILE_100;
+                Serial.printf("[PROFILE] 100%% -- auto-stop at %.1fV (%.3fV/cell)\n",
+                              profile_stop_voltage_dv() * 0.1f, profile_cell_mv[PROFILE_100] / 1000.0f);
+                break;
+
             // ---- Energy reset ----
             case '0':
                 nrg_session_wh = 0.0f;
@@ -2405,9 +3118,46 @@ static String wifi_build_status_json(void) {
     json += "\"lifetime_ah\":" + String(nrg_lifetime_ah, 1) + ",";
     json += "\"prev_wh\":" + String(nrg_prev_wh, 1) + ",";
     json += "\"miles_added\":" + String((cmd_buddy_mode ? nrg_buddy_wh : nrg_session_wh) / range_wh_per_mile, 1) + ",";
-    json += "\"wh_per_mile\":" + String(range_wh_per_mile, 1);
+    json += "\"wh_per_mile\":" + String(range_wh_per_mile, 1) + ",";
+    json += "\"profile\":\"" + String(profile_name(cmd_profile)) + "\",";
+    uint16_t sdv = profile_stop_voltage_dv();
+    json += "\"profile_stop_v\":" + String(sdv > 0 ? sdv * 0.1f : 0.0f, 1) + ",";
+    json += "\"maintain\":" + String(maintain_enabled ? "true" : "false") + ",";
+    json += "\"maintain_waiting\":" + String(maintain_waiting ? "true" : "false") + ",";
+    json += "\"schedule\":" + String(schedule_enabled ? "true" : "false") + ",";
+    json += "\"schedule_time\":\"" + String(schedule_target_hour) + ":" +
+            (schedule_target_min < 10 ? "0" : "") + String(schedule_target_min) + "\",";
+    json += "\"outlet\":\"" + String(outlet_name()) + "\",";
+    json += "\"outlet_max_w\":" + String(outlet_max_watts()) + ",";
+    json += "\"test_dev\":" + String(test_dev_mode ? "true" : "false") + ",";
+    json += "\"peak_watts\":" + String((int)input_peak_watts) + ",";
+    float mbf = get_max_battery_temp_f();
+    json += "\"batt_temp_f\":" + String(mbf > -900.0f ? mbf : 0.0f, 1) + ",";
+    json += "\"thermal_zone\":\"" + String(mbf > -900.0f ? thermal_zone_name(mbf) : "NONE") + "\",";
+    json += "\"thermal_derate\":" + String(thermal_zone_multiplier(mbf) * 100.0f, 0) + ",";
+    json += "\"time_valid\":" + String(time_valid ? "true" : "false") + ",";
+    json += "\"time\":\"" + String(time_hour) + ":" +
+            (time_minute < 10 ? "0" : "") + String(time_minute) + "\",";
+    json += "\"state\":\"" + String(safety_state_name(safety_state)) + "\"";
     json += "}";
     return json;
+}
+
+// WebSocket-style endpoint: /ws returns JSON continuously (long-poll)
+// True WebSocket requires AsyncWebServer library -- this is a simple SSE alternative
+// The app can use EventSource (Server-Sent Events) for real-time updates
+static void wifi_handle_events(void) {
+    WiFiClient client = wifi_server.client();
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/event-stream");
+    client.println("Cache-Control: no-cache");
+    client.println("Connection: keep-alive");
+    client.println();
+
+    // Send one event (client reconnects for next)
+    client.print("data: ");
+    client.println(wifi_build_status_json());
+    client.println();
 }
 
 static void wifi_handle_root(void) {
@@ -2424,6 +3174,51 @@ static void wifi_handle_status(void) {
 static void wifi_handle_cmd(void) {
     if (wifi_server.hasArg("c")) {
         String cmd = wifi_server.arg("c");
+
+        // Multi-char commands (O*, TZ*, TS*, TC*, T0800, S1430)
+        if (cmd.length() >= 2) {
+            char first = cmd.charAt(0);
+
+            // Schedule time: T0800
+            if (first == 'T' && cmd.length() == 5 && cmd.charAt(1) >= '0' && cmd.charAt(1) <= '2') {
+                schedule_target_hour = (cmd.charAt(1) - '0') * 10 + (cmd.charAt(2) - '0');
+                schedule_target_min  = (cmd.charAt(3) - '0') * 10 + (cmd.charAt(4) - '0');
+                if (schedule_target_hour > 23) schedule_target_hour = 23;
+                if (schedule_target_min > 59)  schedule_target_min = 59;
+                Serial.printf("[SCHEDULE] Target time set to %02d:%02d\n",
+                              schedule_target_hour, schedule_target_min);
+                wifi_server.send(200, "application/json",
+                    "{\"ok\":true,\"schedule_time\":\"" +
+                    String(schedule_target_hour) + ":" + String(schedule_target_min) + "\"}");
+                return;
+            }
+
+            // Clock sync: S1430
+            if (first == 'S' && cmd.length() == 5 && cmd.charAt(1) >= '0' && cmd.charAt(1) <= '2') {
+                time_hour   = (cmd.charAt(1) - '0') * 10 + (cmd.charAt(2) - '0');
+                time_minute = (cmd.charAt(3) - '0') * 10 + (cmd.charAt(4) - '0');
+                time_valid  = true;
+                Serial.printf("[TIME] Set to %02d:%02d (from app)\n", time_hour, time_minute);
+                wifi_server.send(200, "application/json",
+                    "{\"ok\":true,\"time\":\"" +
+                    String(time_hour) + ":" + String(time_minute) + "\"}");
+                return;
+            }
+
+            // Outlet, ThermalZone, TempSensor, TempCal
+            if (first == 'O' ||
+                (first == 'T' && cmd.length() >= 3 &&
+                 (cmd.charAt(1) == 'Z' || cmd.charAt(1) == 'S' || cmd.charAt(1) == 'C'))) {
+                char buf[CMD_BUF_SIZE];
+                cmd.toCharArray(buf, CMD_BUF_SIZE);
+                cmd_execute_multi(buf, cmd.length());
+                wifi_server.send(200, "application/json",
+                    "{\"ok\":true,\"cmd\":\"" + cmd + "\"}");
+                return;
+            }
+        }
+
+        // Single-char commands
         for (unsigned int i = 0; i < cmd.length(); i++) {
             cmd_process_char(cmd.charAt(i));
         }
@@ -2439,6 +3234,7 @@ static void wifi_init(void) {
     WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
     wifi_server.on("/", wifi_handle_root);
     wifi_server.on("/status", wifi_handle_status);
+    wifi_server.on("/events", wifi_handle_events);
     wifi_server.on("/cmd", wifi_handle_cmd);
     wifi_server.begin();
     wifi_active = true;
@@ -2449,6 +3245,95 @@ static void wifi_init(void) {
 
 static void wifi_update(void) {
     if (wifi_active) wifi_server.handleClient();
+}
+
+// =============================================================================
+//  CAN INTER-MODULE FRAMES
+// =============================================================================
+// Other modules on the shared CAN bus can send commands to the charger Main Brain.
+// These use higher IDs (lower priority) than the charger control frames.
+
+// Emergency safety frame: any module can send this to force shutdown
+#define CAN_EMERGENCY_STOP_ID    0x00010000UL  // highest priority on bus
+
+// Inter-module command IDs (from other ESP32 modules to Main Brain)
+#define CAN_INTERMOD_CMD_ID      0x1A000001UL  // module -> Main Brain command
+#define CAN_INTERMOD_STATUS_ID   0x1A000002UL  // Main Brain -> modules status broadcast
+
+// Inter-module command bytes:
+// Byte 0: command type
+#define INTERMOD_CMD_ESTOP       0x00  // emergency stop
+#define INTERMOD_CMD_START       0x01  // request charge start
+#define INTERMOD_CMD_STOP        0x02  // request charge stop
+#define INTERMOD_CMD_SET_AMPS    0x03  // Byte 1-2: current_da (big-endian)
+#define INTERMOD_CMD_SET_VOLTS   0x04  // Byte 1-2: voltage_dv (big-endian)
+#define INTERMOD_CMD_SET_PROFILE 0x05  // Byte 1: profile enum
+
+static void can_process_intermod(const twai_message_t *msg) {
+    if (msg->data_length_code < 1) return;
+    uint8_t cmd_type = msg->data[0];
+
+    switch (cmd_type) {
+        case INTERMOD_CMD_ESTOP:
+            cmd_charging = false;
+            nrg_active = false;
+            can_send_disable();
+            safety_state = SAFETY_STATE_FAULT;
+            rgb_led_set_state(RGB_STATE_FAULT);
+            Serial.println("[CAN] EMERGENCY STOP from external module");
+            break;
+
+        case INTERMOD_CMD_START:
+            cmd_charging = true;
+            nrg_active = true;
+            nrg_last_ms = millis();
+            cmd_send_now();
+            Serial.println("[CAN] Charge START from external module");
+            break;
+
+        case INTERMOD_CMD_STOP:
+            cmd_charging = false;
+            nrg_active = false;
+            can_send_disable();
+            Serial.println("[CAN] Charge STOP from external module");
+            break;
+
+        case INTERMOD_CMD_SET_AMPS:
+            if (msg->data_length_code >= 3) {
+                cmd_current_da = ((uint16_t)msg->data[1] << 8) | msg->data[2];
+                cmd_send_now();
+                Serial.printf("[CAN] Current set to %.1fA from external module\n",
+                              cmd_current_da * 0.1f);
+            }
+            break;
+
+        case INTERMOD_CMD_SET_VOLTS:
+            if (msg->data_length_code >= 3) {
+                cmd_voltage_dv = ((uint16_t)msg->data[1] << 8) | msg->data[2];
+                cmd_send_now();
+                Serial.printf("[CAN] Voltage set to %.1fV from external module\n",
+                              cmd_voltage_dv * 0.1f);
+            }
+            break;
+
+        case INTERMOD_CMD_SET_PROFILE:
+            if (msg->data_length_code >= 2 && msg->data[1] < PROFILE_COUNT) {
+                cmd_profile = (ChargeProfile_t)msg->data[1];
+                Serial.printf("[CAN] Profile set to %s from external module\n",
+                              profile_name(cmd_profile));
+            }
+            break;
+    }
+}
+
+// Process inter-module frames from CAN RX queue
+// Called from can_driver_update -- we need to modify it to also check our IDs
+static void can_check_intermod(void) {
+    // The main CAN driver already drains the queue for charger frames.
+    // Inter-module frames with different IDs will also be in the queue
+    // if we set the filter to accept-all (which happens as fallback).
+    // For now, inter-module processing happens inside can_driver_update
+    // where we already iterate received frames.
 }
 
 // =============================================================================
@@ -2509,13 +3394,39 @@ void setup() {
     wifi_init();
     esp_task_wdt_reset();
 
-    // Load lifetime energy from NVS flash
+    // Load settings from NVS flash
     nrg_prefs.begin("charger_nrg", false);
     nrg_lifetime_wh = nrg_prefs.getFloat("lifetime_wh", 0.0f);
     nrg_lifetime_ah = nrg_prefs.getFloat("lifetime_ah", 0.0f);
     range_wh_per_mile = nrg_prefs.getFloat("wh_per_mile", WH_PER_MILE_DEFAULT);
+
+    // Load outlet preset
+    outlet_preset = (OutletPreset_t)nrg_prefs.getUChar("outlet", (uint8_t)OUTLET_110_15A);
+    outlet_voltage_ac = nrg_prefs.getUShort("outlet_v", 110);
+    outlet_amps_ac = nrg_prefs.getUShort("outlet_a", 15);
+    test_dev_mode = (outlet_preset == OUTLET_TEST_DEV);
+
+    // Load thermal zones
+    tz_normal_max_f  = nrg_prefs.getFloat("tz1", 140.0f);
+    tz_caution_max_f = nrg_prefs.getFloat("tz2", 194.0f);
+    tz_danger_max_f  = nrg_prefs.getFloat("tz3", 248.0f);
+
+    // Load calibration offsets
+    for (int i = 1; i <= 5; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "cal%d", i);
+        sensor_ntc_offset_f[i] = nrg_prefs.getFloat(key, 0.0f);
+    }
+    sensor_bms1_offset_f = nrg_prefs.getFloat("calb1", 0.0f);
+    sensor_bms2_offset_f = nrg_prefs.getFloat("calb2", 0.0f);
+
     Serial.printf("[NVS] Lifetime: %.1fWh / %.1fAh  Efficiency: %.1f Wh/mi\n",
                   nrg_lifetime_wh, nrg_lifetime_ah, range_wh_per_mile);
+    Serial.printf("[NVS] Outlet: %s (max %uW)%s\n",
+                  outlet_name(), outlet_max_watts(),
+                  test_dev_mode ? " [DEV MODE]" : "");
+    Serial.printf("[NVS] Thermal zones: NORMAL<%.0fF CAUTION<%.0fF DANGER<%.0fF\n",
+                  tz_normal_max_f, tz_caution_max_f, tz_danger_max_f);
 
     // Start with charger disabled
     can_send_disable();
