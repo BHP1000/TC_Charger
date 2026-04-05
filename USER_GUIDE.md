@@ -601,6 +601,99 @@ The onboard WS2812B LED (GPIO 48) indicates system state:
 
 ---
 
+## Electricity Cost Tracking
+
+Track how much you spend on charging and how much you save at free chargers.
+
+### Set your electricity rate
+
+```
+NC,0.12     <-- $0.12 per kWh (typical US home rate)
+```
+
+### How costs are tracked
+
+| Category | Description |
+|----------|-------------|
+| Session cost | Current charge session cost, shown in status line |
+| Lifetime cost | Total spent on electricity (NVS, survives reboots) |
+| Free energy | Total kWh from free chargers (EV stations default to free) |
+
+EV station outlets (`OG`) default to $0.00/kWh. Home outlets use the rate set with `NC`. The status line shows cost when charging:
+
+```
+[STATUS] HOME CHARGING | Set:84.0V/12.0A ON | Chgr:77.5V/12.0A 930W 73F WORKING | 45.2Wh +1.4mi $0.05
+```
+
+### Restore after flash erase
+
+```
+NC,0.12       <-- rate
+NF,42.30      <-- lifetime cost
+```
+
+---
+
+## Charge Completion Notifications
+
+When a charge completes (profile target reached or manual stop), the firmware:
+
+1. Sends a BLE notification to the app with full session summary (22 bytes)
+2. Sounds the buzzer (3 beeps) if a buzzer is wired to the configured GPIO
+3. Prints a summary to serial: `[NOTIFY] Charge complete -- $0.15 this session`
+
+The app receives the session packet and logs it to the charge history database.
+
+To wire a buzzer: set `BUZZER_PIN` in the code to your GPIO number (default -1 = none).
+
+---
+
+## Time-to-Target Estimates
+
+The `p` status report shows estimated minutes to reach each profile target:
+
+```
+  ---- Time to Target ----
+  STORAGE (76.0V): ~8 min
+  80% (78.4V): ~12 min
+  85% (79.2V): ~14 min
+  90% (80.0V): ~17 min
+  100% (84.0V): ~28 min
+```
+
+Estimates are based on current charge power and voltage delta. They update in real-time as charging progresses.
+
+---
+
+## Thermal Prediction
+
+During charging, the firmware tracks how fast battery temperature is rising. This lets it predict when thermal derating will start.
+
+The `p` report shows:
+```
+  Thermal:  ~45 min to CAUTION at current rate (1.2F/min rise)
+```
+
+This means "at the current charge rate and temperature rise, you have about 45 minutes before the firmware starts reducing charge current."
+
+The prediction improves over time as the firmware learns the thermal behavior of your specific pack at your current charge rate.
+
+---
+
+## GPS Source Selection
+
+Three GPS modes for range calibration accuracy:
+
+| Command | Source | Description |
+|---------|--------|-------------|
+| `GA` | Onboard only | HGLRC M100, single-band L1, ~2.5m accuracy |
+| `GP` | Phone only | Dual-band L1+L5, ~0.3-1.0m accuracy |
+| `GB` | Both (default) | Phone primary, onboard fallback |
+
+The phone sends GPS data to the ESP32 via BLE or WiFi. The app handles all calibration calculations and sends the final Wh/mile result.
+
+---
+
 ## Troubleshooting
 
 ### Charger not responding (UNPLUGGED state)
