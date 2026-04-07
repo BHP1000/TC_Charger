@@ -1,6 +1,8 @@
 // =============================================================================
 // TC_Charger -- Main Brain (ESP32-S3) Consolidated Production Firmware
+// Version:   2.0.0  (2026-04-06)
 // =============================================================================
+//
 // Board:  ESP32S3 Dev Module
 // Flash:  16 MB
 // PSRAM:  OPI
@@ -8,12 +10,47 @@
 // Serial: 115200
 //
 // Required Libraries (install via Arduino Library Manager):
+//   - NimBLE-Arduino  (BLE server + TPMS scanner)
 //   - FastLED
 //   - U8g2
 //   - Adafruit AHTX0
-//   - Adafruit BMP280
+//   - Adafruit BMP280 Library
 //   - TinyGPSPlus
-//   (BLE + TWAI are built-in with the ESP32 board package)
+//   - PubSubClient  (MQTT for Home Assistant)
+//
+// ============================================================
+//  CHANGELOG
+// ============================================================
+//
+//  v2.0.0  (2026-04-06)
+//    - Migrated BLE from stock ESP32 library to NimBLE-Arduino 2.5.0
+//    - Added TPMS BLE scanner (passive scan, dual protocol decoder)
+//    - TPMS discovery mode (TPMSD), MAC assignment (TPMSF/TPMSR), NVS persist
+//    - Added WiFi STA + MQTT for Home Assistant (PubSubClient)
+//    - HA auto-discovery (8 sensor entities published on first connect)
+//    - WiFi credential commands (WS/WP/WH/WM/WI/WC/WD)
+//    - Added direct value set commands (SV/SA/SM/SR/SP/SO)
+//    - Fixed BLE write command handler (getValue -> NimBLEAttValue)
+//    - Fixed CAN bus-off recovery (TWAI state machine auto-reinit)
+//    - BLE MTU 256 negotiation (NimBLEDevice::setMTU)
+//    - COMM_INTERFACE_BLUEPRINT.md created (full integration reference)
+//
+//  v1.0.0  (2026-04-04)
+//    - Initial consolidated firmware (stock ESP32 BLE library)
+//    - CAN charger control (HK-LF-115-58 6.6kW OBC)
+//    - Serial command interface (single + multi-char)
+//    - Charge profiles (Manual/Storage/80/85/90/100%)
+//    - Buddy mode, maintain mode, scheduled charging
+//    - Outlet presets with power clamping
+//    - Thermal zone protection with linear derating
+//    - Energy tracking (session/lifetime/buddy) with cost
+//    - WiFi AP with JSON API (/status, /cmd, /events)
+//    - BLE server with 11 characteristics at 1Hz
+//    - OLED display (7 pages), RGB LED, GPS, compass
+//    - RS485 to Temp Node daughter board
+//    - CAN inter-module commands (emergency stop, start/stop, set V/A)
+//    - NVS persistent settings
+//
 // =============================================================================
 
 #include <esp_task_wdt.h>
@@ -22,15 +59,19 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <FastLED.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_BMP280.h>
 #include <TinyGPSPlus.h>
+#include <PubSubClient.h>
+
+// =============================================================================
+//  FIRMWARE VERSION
+// =============================================================================
+
+#define FW_VERSION "2.0.0"
 
 // =============================================================================
 //  CONFIGURATION & CONSTANTS
@@ -387,6 +428,7 @@ bool button_hold_active(void);
 
 // Serial/BLE/WiFi command processor
 static void cmd_process_char(char c);
+static void cmd_execute_multi(const char *buf, uint8_t len);
 static void cmd_send_now(void);
 
 // CAN inter-module
@@ -675,7 +717,34 @@ static float    tpms_rear_temp_f  = 0.0f;
 static bool     tpms_front_valid  = false;
 static bool     tpms_rear_valid   = false;
 static uint32_t tpms_last_ms      = 0;
-#define TPMS_TIMEOUT_MS  60000UL  // sensor lost if no data for 60s
+#define TPMS_TIMEOUT_MS  600000UL  // sensor lost if no data for 10 min (sensors sleep ~8 min)
+
+// ---- WiFi Station mode (home network for Home Assistant MQTT) ----
+#define WIFI_STA_RETRY_MS       30000UL   // retry connection every 30s
+#define MQTT_PUBLISH_MS         5000UL    // publish telemetry every 5s
+#define MQTT_TOPIC_STATE        "scooter_charger/state"
+#define MQTT_TOPIC_CMD          "scooter_charger/cmd"
+#define MQTT_TOPIC_DISCOVERY    "homeassistant/sensor/scooter_charger"
+#define MQTT_CLIENT_ID          "ScooterCharger"
+
+static char     wifi_sta_ssid[33]     = "";   // NVS
+static char     wifi_sta_pass[65]     = "";   // NVS
+static char     mqtt_host[64]         = "";   // NVS
+static uint16_t mqtt_port             = 1883; // NVS
+static bool     wifi_sta_connected    = false;
+static uint32_t wifi_sta_retry_ms     = 0;
+static uint32_t mqtt_last_publish_ms  = 0;
+static bool     mqtt_discovery_sent   = false;
+
+static WiFiClient mqtt_wifi_client;
+static PubSubClient mqtt_client(mqtt_wifi_client);
+
+// Forward declarations for WiFi STA + MQTT
+static void wifi_sta_connect(void);
+static void mqtt_callback(char *topic, byte *payload, unsigned int length);
+static void mqtt_publish_state(void);
+static void mqtt_send_discovery(void);
+static void wifi_sta_update(void);
 
 // ---- Session summary for app logging (BLE characteristic) ----
 // Packed into existing charger telemetry + new session end characteristic
@@ -695,6 +764,8 @@ static bool            can_initialized      = false;
 static ChargerCmd_t    can_last_cmd         = {0, 0, CAN_CTRL_DISABLE, CAN_MODE_CHARGE};
 static ChargerStatus_t can_charger_status   = {};
 static uint32_t        can_last_tx_ms       = 0;
+static bool            can_bus_recovering   = false;   // TWAI bus-off recovery in progress
+static uint32_t        can_recovery_ms      = 0;       // when recovery started
 static uint32_t        can_last_rx_ms       = 0;
 
 // Smoothed values for display (EMA alpha=0.1, smooths pulse charging spikes)
@@ -850,13 +921,15 @@ void can_driver_init(void) {
 }
 
 bool can_send_disable(void) {
-    can_last_cmd = {0, 0, CAN_CTRL_DISABLE, CAN_MODE_CHARGE};
+    ChargerCmd_t c = {0, 0, CAN_CTRL_DISABLE, CAN_MODE_CHARGE};
+    can_last_cmd = c;
     if (!can_initialized) return false;
     return twai_send_frame(&can_last_cmd);
 }
 
 bool can_send_sleep(void) {
-    can_last_cmd = {0, 0, CAN_CTRL_SLEEP, CAN_MODE_CHARGE};
+    ChargerCmd_t c = {0, 0, CAN_CTRL_SLEEP, CAN_MODE_CHARGE};
+    can_last_cmd = c;
     if (!can_initialized) return false;
     return twai_send_frame(&can_last_cmd);
 }
@@ -879,6 +952,49 @@ bool can_read_status(ChargerStatus_t *out) {
 
 void can_driver_update(void) {
     if (!can_initialized) return;
+
+    // --- TWAI bus-off recovery ---
+    // If the TWAI peripheral enters bus-off (e.g., noise during charger plug-in),
+    // it stops all TX/RX. We must detect this and recover automatically so the
+    // charger can be detected after hot-plug without rebooting the ESP32.
+    twai_status_info_t twai_info;
+    if (twai_get_status_info(&twai_info) == ESP_OK) {
+        if (twai_info.state == TWAI_STATE_BUS_OFF) {
+            if (!can_bus_recovering) {
+                can_bus_recovering = true;
+                can_recovery_ms = millis();
+                twai_initiate_recovery();
+                Serial.println("[CAN] Bus-off detected -- initiating recovery");
+            } else if ((millis() - can_recovery_ms) > 2000) {
+                // Recovery taking too long -- full reinit
+                can_bus_recovering = false;
+                twai_stop();
+                twai_driver_uninstall();
+                can_initialized = false;
+                Serial.println("[CAN] Recovery timeout -- reinitializing TWAI");
+                can_driver_init();
+            }
+            return;  // skip TX/RX while in bus-off
+        } else if (twai_info.state == TWAI_STATE_RECOVERING) {
+            // Still recovering -- check timeout but don't call twai_start yet
+            if (can_bus_recovering && (millis() - can_recovery_ms) > 2000) {
+                can_bus_recovering = false;
+                twai_stop();
+                twai_driver_uninstall();
+                can_initialized = false;
+                Serial.println("[CAN] Recovery timeout -- reinitializing TWAI");
+                can_driver_init();
+            }
+            return;  // skip TX/RX while recovering
+        } else if (can_bus_recovering) {
+            // Recovery complete (state is STOPPED) -- restart TWAI
+            can_bus_recovering = false;
+            twai_start();
+            can_last_tx_ms = millis();
+            can_last_rx_ms = millis();
+            Serial.println("[CAN] Bus recovery complete -- resuming");
+        }
+    }
 
     if ((millis() - can_last_tx_ms) >= CAN_TX_INTERVAL_MS) {
         twai_send_frame(&can_last_cmd);
@@ -1590,45 +1706,80 @@ void safety_sm_report_comm_timeout(bool timeout)  { (void)timeout; }
 //  BLE SERVER
 // =============================================================================
 
-static BLEServer           *ble_server_ptr      = nullptr;
-static BLECharacteristic   *ble_ch_state    = nullptr;
-static BLECharacteristic   *ble_ch_temp     = nullptr;
-static BLECharacteristic   *ble_ch_cur      = nullptr;
-static BLECharacteristic   *ble_ch_voltage  = nullptr;
-static BLECharacteristic   *ble_ch_bms_pack    = nullptr;
-static BLECharacteristic   *ble_ch_bms_health  = nullptr;
-static BLECharacteristic   *ble_ch_bms_cells   = nullptr;
-static BLECharacteristic   *ble_ch_gps         = nullptr;
-static BLECharacteristic   *ble_ch_cmd         = nullptr;
-static BLECharacteristic   *ble_ch_charger     = nullptr;
-static BLECharacteristic   *ble_ch_session_end = nullptr;
+static NimBLEServer           *ble_server_ptr      = nullptr;
+static NimBLECharacteristic   *ble_ch_state    = nullptr;
+static NimBLECharacteristic   *ble_ch_temp     = nullptr;
+static NimBLECharacteristic   *ble_ch_cur      = nullptr;
+static NimBLECharacteristic   *ble_ch_voltage  = nullptr;
+static NimBLECharacteristic   *ble_ch_bms_pack    = nullptr;
+static NimBLECharacteristic   *ble_ch_bms_health  = nullptr;
+static NimBLECharacteristic   *ble_ch_bms_cells   = nullptr;
+static NimBLECharacteristic   *ble_ch_gps         = nullptr;
+static NimBLECharacteristic   *ble_ch_cmd         = nullptr;
+static NimBLECharacteristic   *ble_ch_charger     = nullptr;
+static NimBLECharacteristic   *ble_ch_session_end = nullptr;
 static bool                 ble_connected  = false;
 static uint16_t             ble_pack_voltage_dv = 840;
 static uint32_t             ble_last_notify_ms  = 0;
 
-class CmdWriteCB : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *ch) override {
-        const uint8_t *data = ch->getData();
-        uint16_t len = ch->getLength();
-        for (uint16_t i = 0; i < len; i++) {
-            cmd_process_char((char)data[i]);
+class CmdWriteCB : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *ch, NimBLEConnInfo &connInfo) override {
+        // NimBLE getValue() returns NimBLEAttValue with .data(), .size(), .c_str()
+        NimBLEAttValue val = ch->getValue();
+        if (val.size() == 0) return;
+
+        // Debug echo to serial so Putty shows BLE-received commands
+        Serial.printf("[BLE] cmd(%u): ", (unsigned)val.size());
+        for (unsigned i = 0; i < val.size(); i++) {
+            char c = (char)val.data()[i];
+            if (c >= 0x20 && c <= 0x7E) Serial.print(c);
+            else Serial.printf("\\x%02X", (uint8_t)c);
+        }
+        Serial.println();
+
+        // Multi-char commands (2+ chars): send directly to cmd_execute_multi
+        if (val.size() >= 2 && val.data()[0] != '\r' && val.data()[0] != '\n') {
+            char buf[CMD_BUF_SIZE];
+            size_t blen = val.size();
+            if (blen > CMD_BUF_SIZE - 1) blen = CMD_BUF_SIZE - 1;
+            memcpy(buf, val.data(), blen);
+            buf[blen] = '\0';
+            // Strip trailing CR/LF
+            while (blen > 0 && (buf[blen-1] == '\r' || buf[blen-1] == '\n')) {
+                buf[--blen] = '\0';
+            }
+            if (blen >= 2) {
+                cmd_execute_multi(buf, (uint8_t)blen);
+                return;
+            }
+        }
+
+        // Single-char commands: process each byte
+        for (unsigned i = 0; i < val.size(); i++) {
+            char c = (char)val.data()[i];
+            if (c == '\r' || c == '\n' || c == '\0') continue;
+            cmd_process_char(c);
         }
     }
 };
 
-class ServerCB : public BLEServerCallbacks {
-    void onConnect(BLEServer *)    override { ble_connected = true;  Serial.println("[BLE] client connected"); }
-    void onDisconnect(BLEServer *srv) override {
+class ServerCB : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer *srv, NimBLEConnInfo &connInfo) override {
+        ble_connected = true;
+        Serial.println("[BLE] client connected");
+    }
+    void onDisconnect(NimBLEServer *srv, NimBLEConnInfo &connInfo, int reason) override {
         ble_connected = false;
-        Serial.println("[BLE] client disconnected, restarting advertising");
-        srv->startAdvertising();
+        Serial.printf("[BLE] client disconnected (reason=%d), restarting advertising\n", reason);
+        NimBLEDevice::startAdvertising();
     }
 };
 
-class VoltageCB : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *ch) override {
-        if (ch->getLength() >= 2) {
-            const uint8_t *d = ch->getData();
+class VoltageCB : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *ch, NimBLEConnInfo &connInfo) override {
+        NimBLEAttValue val = ch->getValue();
+        if (val.size() >= 2) {
+            const uint8_t *d = val.data();
             ble_pack_voltage_dv = (uint16_t)(d[0] | (d[1] << 8));
             Serial.printf("[BLE] pack voltage set -> %u dV (%.1f V)\n",
                           ble_pack_voltage_dv, ble_pack_voltage_dv * 0.1f);
@@ -1637,42 +1788,43 @@ class VoltageCB : public BLECharacteristicCallbacks {
 };
 
 void ble_server_init(void) {
-    BLEDevice::init(BLE_DEVICE_NAME);
-    ble_server_ptr = BLEDevice::createServer();
+    NimBLEDevice::init(BLE_DEVICE_NAME);
+    NimBLEDevice::setMTU(256);  // Accept MTU negotiation up to 256 bytes (app requests this)
+    ble_server_ptr = NimBLEDevice::createServer();
     ble_server_ptr->setCallbacks(new ServerCB());
 
-    BLEService *svc = ble_server_ptr->createService(BLEUUID(SVC_UUID), 48);
+    NimBLEService *svc = ble_server_ptr->createService(SVC_UUID);
 
     ble_ch_state = svc->createCharacteristic(CHAR_SAFETY_STATE_UUID,
-                     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     ble_ch_temp = svc->createCharacteristic(CHAR_MAX_TEMP_UUID,
-                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     ble_ch_cur = svc->createCharacteristic(CHAR_CHARGE_CUR_UUID,
-                   BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                   NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     ble_ch_voltage = svc->createCharacteristic(CHAR_PACK_VOLTAGE_UUID,
-                       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+                       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
     ble_ch_voltage->setCallbacks(new VoltageCB());
     uint8_t vbuf[2] = { (uint8_t)(ble_pack_voltage_dv & 0xFF), (uint8_t)(ble_pack_voltage_dv >> 8) };
     ble_ch_voltage->setValue(vbuf, 2);
 
     ble_ch_bms_pack = svc->createCharacteristic(CHAR_BMS_PACK_UUID,
-                        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     ble_ch_bms_health = svc->createCharacteristic(CHAR_BMS_HEALTH_UUID,
-                          BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     ble_ch_bms_cells = svc->createCharacteristic(CHAR_BMS_CELLS_UUID,
-                         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     ble_ch_gps = svc->createCharacteristic(CHAR_GPS_UUID,
-                   BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                   NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     // Command input -- phone/app writes single-char commands here
     ble_ch_cmd = svc->createCharacteristic(CHAR_CMD_UUID,
-                     BLECharacteristic::PROPERTY_WRITE);
+                     NIMBLE_PROPERTY::WRITE);
     ble_ch_cmd->setCallbacks(new CmdWriteCB());
 
     // Charger telemetry -- packed binary, notify at 1Hz
@@ -1680,19 +1832,19 @@ void ble_server_init(void) {
     // [8-11] lifetime_wh (float)  [12] charging  [13] buddy_mode
     // [14-17] power_w (float)  [18-21] miles_added (float)
     ble_ch_charger = svc->createCharacteristic(CHAR_CHARGER_UUID,
-                         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     // Session end summary -- notified once when charge stops
     // App reads this to log session: start_v(2) end_v(2) wh(4) ah(4) duration_s(4) profile(1) outlet(1) cost(4) = 22 bytes
     ble_ch_session_end = svc->createCharacteristic(CHAR_SESSION_END_UUID,
-                             BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+                             NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
-    svc->start();
-    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    // NimBLE 2.5.0: services start automatically when server starts (svc->start() deprecated)
+    ble_server_ptr->start();
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(SVC_UUID);
-    adv->setScanResponse(true);
     adv->start();
-    Serial.println("[BLE] advertising as " BLE_DEVICE_NAME);
+    Serial.println("[BLE] NimBLE advertising as " BLE_DEVICE_NAME);
 }
 
 void ble_server_update(void) {
@@ -1836,6 +1988,315 @@ static void notify_charge_complete(float start_v, float end_v, float wh, float a
         rgb_led_set_state(RGB_STATE_IDLE);      // off
         FastLED.show();
         delay(300);
+    }
+}
+
+// =============================================================================
+//  TPMS BLE SCANNER (reads broadcast-only tire pressure sensors)
+// =============================================================================
+// Chinese BLE TPMS valve cap sensors broadcast advertisements continuously.
+// No pairing or connection required -- we passively scan and decode.
+// Two common protocols: "BR/SYTPMS" (service UUID 0x27A5, 7-byte mfr data)
+// and "ZEEPIN/TP630" (18-byte mfr data). Discovery mode detects both.
+// MAC addresses stored in NVS to filter only our sensors.
+
+#define TPMS_SCAN_INTERVAL_MS   10000UL  // scan window: run scan every 10 seconds
+#define TPMS_SCAN_DURATION_SEC  5        // each scan lasts 5 seconds
+#define TPMS_DISCOVER_SEC       30       // discovery mode scan duration
+#define TPMS_ALERT_REPEAT_MS    300000UL // repeat alerts every 5 minutes (not every scan)
+
+// Adjustable alert thresholds (saved to NVS)
+static float    tpms_alert_low_psi    = 30.0f;   // low pressure warning
+static float    tpms_alert_crit_psi   = 20.0f;   // critical low -- immediate danger
+static float    tpms_alert_high_psi   = 48.0f;   // over-pressure warning
+static float    tpms_alert_high_temp_f = 158.0f;  // high temp warning (70C)
+static float    tpms_alert_crit_temp_f = 185.0f;  // critical temp (85C)
+
+// Alert rate limiting -- only repeat after TPMS_ALERT_REPEAT_MS
+static uint32_t tpms_front_alert_ms = 0;
+static uint32_t tpms_rear_alert_ms  = 0;
+
+// Broadcast interval measurement
+static uint32_t tpms_front_last_rx_ms = 0;  // timestamp of last front advertisement
+static uint32_t tpms_rear_last_rx_ms  = 0;  // timestamp of last rear advertisement
+static float    tpms_front_interval_s = 0;  // measured interval (seconds, EMA smoothed)
+static float    tpms_rear_interval_s  = 0;
+static bool     tpms_debug_interval   = false;  // print every rx with timing
+
+// EMA smoothing for display (eliminates 0.1 PSI jitter at ADC boundary)
+#define TPMS_EMA_ALPHA  0.3f
+static float    tpms_front_psi_raw    = 0;  // raw from sensor (before smoothing)
+static float    tpms_rear_psi_raw     = 0;
+static float    tpms_front_temp_raw   = 0;
+static float    tpms_rear_temp_raw    = 0;
+static bool     tpms_front_primed     = false;  // first reading seeds EMA
+static bool     tpms_rear_primed      = false;
+
+// Slow leak detection -- alert if PSI drops > threshold over time
+#define TPMS_LEAK_DROP_PSI    3.0f     // alert if pressure drops this much
+#define TPMS_LEAK_TIME_MS     1800000UL  // over 30 minutes minimum
+static float    tpms_front_baseline_psi = 0;  // baseline PSI for leak detection
+static float    tpms_rear_baseline_psi  = 0;
+static uint32_t tpms_front_baseline_ms  = 0;  // when baseline was set
+static uint32_t tpms_rear_baseline_ms   = 0;
+
+static bool     tpms_scan_active    = false;
+static bool     tpms_discovering    = false;  // discovery mode: log all TPMS devices
+static uint32_t tpms_last_scan_ms   = 0;
+static char     tpms_front_mac[18]  = "";     // "AA:BB:CC:DD:EE:FF" NVS
+static char     tpms_rear_mac[18]   = "";     // NVS
+static float    tpms_front_battery  = 0.0f;   // volts or percent
+static float    tpms_rear_battery   = 0.0f;
+
+// Forward declaration
+static void tpms_process_advertisement(const NimBLEAdvertisedDevice *dev);
+
+class TPMSScanCB : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice *dev) override {
+        tpms_process_advertisement(dev);
+    }
+    void onScanEnd(const NimBLEScanResults &results, int reason) override {
+        tpms_scan_active = false;
+        if (tpms_discovering) {
+            tpms_discovering = false;
+            Serial.println("[TPMS] Discovery scan complete -- switching to normal mode");
+        }
+    }
+};
+
+static TPMSScanCB tpms_scan_cb;
+
+static void tpms_start_scan(uint32_t duration_sec) {
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    scan->setScanCallbacks(&tpms_scan_cb, true);  // true = want duplicates (repeated ads)
+    scan->setActiveScan(false);    // passive scan -- don't send scan requests
+    scan->setInterval(100);        // scan interval (ms)
+    scan->setWindow(99);           // scan window (ms, nearly continuous)
+    scan->setMaxResults(0);        // 0 = don't store results, just use callbacks
+    // NimBLE 2.5.0: start() duration is in MILLISECONDS (passed to ble_gap_disc)
+    bool ok = scan->start(duration_sec * 1000, false);
+    tpms_scan_active = ok;
+    if (!ok) {
+        Serial.println("[TPMS] Scan failed to start");
+    }
+}
+
+static void tpms_process_advertisement(const NimBLEAdvertisedDevice *dev) {
+    // Check if this device has manufacturer data (AD type 0xFF)
+    if (!dev->haveManufacturerData()) return;
+
+    std::string mfr = dev->getManufacturerData();
+    std::string addr = dev->getAddress().toString();
+    int8_t rssi = dev->getRSSI();
+
+    // Discovery mode: log everything that looks like TPMS
+    if (tpms_discovering) {
+        // Log any device with manufacturer data in TPMS-like size range
+        if (mfr.size() >= 5 && mfr.size() <= 20) {
+            Serial.printf("[TPMS-DISCOVER] MAC=%s  RSSI=%d  Name='%s'  MfrData(%u)=",
+                          addr.c_str(), rssi,
+                          dev->haveName() ? dev->getName().c_str() : "",
+                          (unsigned)mfr.size());
+            for (unsigned i = 0; i < mfr.size(); i++)
+                Serial.printf("%02X ", (uint8_t)mfr[i]);
+            Serial.println();
+
+            // Also check for service UUID 0x27A5 (BR/SYTPMS type)
+            if (dev->haveServiceUUID() && dev->isAdvertisingService(NimBLEUUID((uint16_t)0x27A5))) {
+                Serial.printf("  -> BR/SYTPMS type detected (UUID 0x27A5)\n");
+            }
+        }
+        return;
+    }
+
+    // Normal mode: only process our configured sensors
+    if (!tpms_enabled) return;
+    if (tpms_front_mac[0] == '\0' && tpms_rear_mac[0] == '\0') return;
+
+    bool is_front = (tpms_front_mac[0] && addr == tpms_front_mac);
+    bool is_rear  = (tpms_rear_mac[0]  && addr == tpms_rear_mac);
+    if (!is_front && !is_rear) return;
+
+    // Decode based on manufacturer data size
+    float psi = 0.0f;
+    float temp_f = 0.0f;
+    float batt = 0.0f;
+
+    if (mfr.size() >= 18 && (uint8_t)mfr[0] == 0x00 && (uint8_t)mfr[1] == 0x01) {
+        // ZEEPIN/CozyLife format (confirmed working with dohome sensors):
+        //   Bytes 0-1:   Company ID 0x0001
+        //   Bytes 2-7:   Sensor MAC address
+        //   Bytes 8-11:  Pressure in Pascals (uint32 LE)
+        //   Bytes 12-15: Temperature x100 in Celsius (int32 LE)
+        //   Byte 16:     Battery percentage
+        //   Byte 17:     Alarm flag (0x00 = normal)
+        uint32_t press_pa = (uint8_t)mfr[8] | ((uint8_t)mfr[9] << 8) |
+                            ((uint8_t)mfr[10] << 16) | ((uint8_t)mfr[11] << 24);
+        int32_t  temp_100 = (uint8_t)mfr[12] | ((uint8_t)mfr[13] << 8) |
+                            ((uint8_t)mfr[14] << 16) | ((uint8_t)mfr[15] << 24);
+        uint8_t  batt_pct = (uint8_t)mfr[16];
+
+        psi = press_pa / 6894.76f;  // Pa to PSI
+        temp_f = (temp_100 / 100.0f) * 9.0f / 5.0f + 32.0f;
+        batt = batt_pct;
+    } else if (mfr.size() >= 6 && mfr.size() <= 9) {
+        // BR/SYTPMS format (fallback for other sensor brands):
+        //   Byte 0: status flags
+        //   Byte 1: battery voltage x10
+        //   Byte 2: temperature in Celsius
+        //   Bytes 3-4: pressure (encoding varies by clone)
+        uint8_t bat_raw  = (uint8_t)mfr[1];
+        uint8_t temp_c   = (uint8_t)mfr[2];
+        uint16_t pres_raw = ((uint8_t)mfr[3] << 8) | (uint8_t)mfr[4];
+
+        batt = bat_raw / 10.0f;
+        temp_f = temp_c * 9.0f / 5.0f + 32.0f;
+
+        if (pres_raw > 0 && pres_raw < 1000) {
+            psi = pres_raw / 10.0f;
+        } else if (pres_raw >= 1000) {
+            psi = pres_raw * 0.145038f / 10.0f;
+        }
+    }
+
+    if (psi < 0.1f) return;  // no valid pressure decoded
+
+    // Measure broadcast interval
+    uint32_t rx_now = millis();
+    if (is_front) {
+        if (tpms_front_last_rx_ms > 0) {
+            float dt = (rx_now - tpms_front_last_rx_ms) / 1000.0f;
+            if (dt > 0.5f && dt < 300.0f) {  // filter out duplicates and wraparound
+                if (tpms_front_interval_s < 0.1f) tpms_front_interval_s = dt;
+                else tpms_front_interval_s += 0.3f * (dt - tpms_front_interval_s);  // EMA
+            }
+            if (tpms_debug_interval)
+                Serial.printf("[TPMS] FRONT rx  dt=%.1fs  avg=%.1fs  %.1fPSI %.0fF\n",
+                              dt, tpms_front_interval_s, psi, temp_f);
+        }
+        tpms_front_last_rx_ms = rx_now;
+    } else {
+        if (tpms_rear_last_rx_ms > 0) {
+            float dt = (rx_now - tpms_rear_last_rx_ms) / 1000.0f;
+            if (dt > 0.5f && dt < 300.0f) {
+                if (tpms_rear_interval_s < 0.1f) tpms_rear_interval_s = dt;
+                else tpms_rear_interval_s += 0.3f * (dt - tpms_rear_interval_s);
+            }
+            if (tpms_debug_interval)
+                Serial.printf("[TPMS] REAR  rx  dt=%.1fs  avg=%.1fs  %.1fPSI %.0fF\n",
+                              dt, tpms_rear_interval_s, psi, temp_f);
+        }
+        tpms_rear_last_rx_ms = rx_now;
+    }
+
+    // Store data with EMA smoothing (eliminates 0.1 PSI jitter)
+    if (is_front) {
+        tpms_front_psi_raw  = psi;
+        tpms_front_temp_raw = temp_f;
+        if (!tpms_front_primed) {
+            tpms_front_psi    = psi;
+            tpms_front_temp_f = temp_f;
+            tpms_front_baseline_psi = psi;
+            tpms_front_baseline_ms  = rx_now;
+            tpms_front_primed = true;
+        } else {
+            tpms_front_psi    += TPMS_EMA_ALPHA * (psi - tpms_front_psi);
+            tpms_front_temp_f += TPMS_EMA_ALPHA * (temp_f - tpms_front_temp_f);
+        }
+        tpms_front_battery = batt;
+        tpms_front_valid   = true;
+        tpms_last_ms       = rx_now;
+
+        // Slow leak detection
+        if (tpms_front_baseline_ms > 0 &&
+            (rx_now - tpms_front_baseline_ms) >= TPMS_LEAK_TIME_MS) {
+            float drop = tpms_front_baseline_psi - tpms_front_psi;
+            if (drop >= TPMS_LEAK_DROP_PSI) {
+                Serial.printf("[TPMS] *** FRONT SLOW LEAK: dropped %.1f PSI in %lu min ***\n",
+                              drop, (unsigned long)((rx_now - tpms_front_baseline_ms) / 60000));
+            }
+            tpms_front_baseline_psi = tpms_front_psi;  // reset baseline
+            tpms_front_baseline_ms  = rx_now;
+        }
+    } else {
+        tpms_rear_psi_raw  = psi;
+        tpms_rear_temp_raw = temp_f;
+        if (!tpms_rear_primed) {
+            tpms_rear_psi    = psi;
+            tpms_rear_temp_f = temp_f;
+            tpms_rear_baseline_psi = psi;
+            tpms_rear_baseline_ms  = rx_now;
+            tpms_rear_primed = true;
+        } else {
+            tpms_rear_psi    += TPMS_EMA_ALPHA * (psi - tpms_rear_psi);
+            tpms_rear_temp_f += TPMS_EMA_ALPHA * (temp_f - tpms_rear_temp_f);
+        }
+        tpms_rear_battery = batt;
+        tpms_rear_valid   = true;
+        tpms_last_ms      = rx_now;
+
+        // Slow leak detection
+        if (tpms_rear_baseline_ms > 0 &&
+            (rx_now - tpms_rear_baseline_ms) >= TPMS_LEAK_TIME_MS) {
+            float drop = tpms_rear_baseline_psi - tpms_rear_psi;
+            if (drop >= TPMS_LEAK_DROP_PSI) {
+                Serial.printf("[TPMS] *** REAR SLOW LEAK: dropped %.1f PSI in %lu min ***\n",
+                              drop, (unsigned long)((rx_now - tpms_rear_baseline_ms) / 60000));
+            }
+            tpms_rear_baseline_psi = tpms_rear_psi;
+            tpms_rear_baseline_ms  = rx_now;
+        }
+    }
+
+    // Alerts (rate-limited: only repeat after TPMS_ALERT_REPEAT_MS)
+    uint32_t *last_alert = is_front ? &tpms_front_alert_ms : &tpms_rear_alert_ms;
+    uint32_t alert_now = millis();
+    bool alert_due = (alert_now - *last_alert) >= TPMS_ALERT_REPEAT_MS || *last_alert == 0;
+
+    if (alert_due) {
+        const char *wheel = is_front ? "FRONT" : "REAR";
+        bool alerted = false;
+
+        if (psi < tpms_alert_crit_psi) {
+            Serial.printf("[TPMS] *** %s CRITICAL LOW: %.1f PSI ***\n", wheel, psi);
+            alerted = true;
+        } else if (psi < tpms_alert_low_psi) {
+            Serial.printf("[TPMS] %s low pressure: %.1f PSI\n", wheel, psi);
+            alerted = true;
+        }
+        if (psi > tpms_alert_high_psi) {
+            Serial.printf("[TPMS] %s high pressure: %.1f PSI\n", wheel, psi);
+            alerted = true;
+        }
+        if (temp_f > tpms_alert_crit_temp_f) {
+            Serial.printf("[TPMS] *** %s CRITICAL TEMP: %.0fF ***\n", wheel, temp_f);
+            alerted = true;
+        } else if (temp_f > tpms_alert_high_temp_f) {
+            Serial.printf("[TPMS] %s high temp: %.0fF\n", wheel, temp_f);
+            alerted = true;
+        }
+
+        if (alerted) *last_alert = alert_now;
+    }
+}
+
+static void tpms_scan_update(void) {
+    if (!tpms_enabled && !tpms_discovering) return;
+    if (tpms_scan_active) return;  // scan in progress
+
+    uint32_t now = millis();
+    if ((now - tpms_last_scan_ms) >= TPMS_SCAN_INTERVAL_MS) {
+        tpms_last_scan_ms = now;
+        tpms_start_scan(tpms_discovering ? TPMS_DISCOVER_SEC : TPMS_SCAN_DURATION_SEC);
+    }
+
+    // Stale data check
+    if (tpms_enabled && tpms_last_ms > 0 && (now - tpms_last_ms) > TPMS_TIMEOUT_MS) {
+        if (tpms_front_valid || tpms_rear_valid) {
+            tpms_front_valid = false;
+            tpms_rear_valid  = false;
+            Serial.println("[TPMS] Sensor data stale -- no signal for 60s");
+        }
     }
 }
 
@@ -2534,15 +2995,35 @@ static void cmd_print_help(void) {
     Serial.println("  NF,42.30 - Set lifetime cost ($)");
     Serial.println("  ND       - Dump all NVS values (backup)");
     Serial.println("  GA/GP/GB - GPS: onboard/phone/both");
-    Serial.println("  TPMS1    - Enable tire pressure (from VESC CAN)");
-    Serial.println("  TPMS0    - Disable tire pressure");
+    Serial.println("  TPMS1    - Enable TPMS BLE scanning");
+    Serial.println("  TPMS0    - Disable TPMS");
+    Serial.println("  TPMSD    - Discover sensors (scan 30s, log all MACs)");
+    Serial.println("  TPMSF,MAC - Set front sensor MAC (e.g. TPMSF,aa:bb:cc:dd:ee:ff)");
+    Serial.println("  TPMSR,MAC - Set rear sensor MAC");
+    Serial.println("  TPMSI    - Show TPMS status and sensor info");
+    Serial.println("  --- Direct set (for app control) ---");
+    Serial.println("  SV,84.0  - Set exact voltage");
+    Serial.println("  SA,12.0  - Set exact current (amps)");
+    Serial.println("  SM,84.0,12.0 - Set voltage + current together");
+    Serial.println("  SP,3     - Set profile (1=Manual..6=100%)");
+    Serial.println("  SO,A     - Set outlet by letter (A-F,G,U)");
+    Serial.println("  SR       - Request full status dump");
+    Serial.println("  S1430    - Set clock to 14:30 (HHMM)");
+    Serial.println("  --- WiFi / MQTT (Home Assistant) ---");
+    Serial.println("  WS,SSID  - Set home WiFi SSID");
+    Serial.println("  WP,PASS  - Set home WiFi password");
+    Serial.println("  WH,IP    - Set MQTT broker address");
+    Serial.println("  WM,1883  - Set MQTT port");
+    Serial.println("  WI       - Show WiFi/MQTT status");
+    Serial.println("  WC       - Force WiFi connect now");
+    Serial.println("  WD       - Disconnect WiFi STA");
     Serial.println("========================================");
     Serial.println();
 }
 
 static void cmd_print_status(void) {
     Serial.println();
-    Serial.println("------------ Status Report ------------");
+    Serial.println("-------- Status Report v" FW_VERSION " --------");
 
     // Mode
     Serial.printf("  State:     %s\n", safety_state_name(safety_state));
@@ -2797,7 +3278,14 @@ static void serial_command_update(void) {
         bool has_rx = can_read_status(&cs);
 
         const char *st_name = safety_state_name(safety_state);
-        Serial.printf("[STATUS] %s%s %s | Set:%.1fV/%.1fA %s | ",
+        // Timestamp: HH:MM if clock valid, otherwise uptime MM:SS
+        if (time_valid)
+            Serial.printf("[%02d:%02d] ", time_hour, time_minute);
+        else {
+            uint32_t up = now / 1000;
+            Serial.printf("[%02lu:%02lu] ", (unsigned long)(up / 60) % 100, (unsigned long)(up % 60));
+        }
+        Serial.printf("%s%s %s | Set:%.1fV/%.1fA %s | ",
                       test_dev_mode ? "[DEV] " : "",
                       cmd_buddy_mode ? "BUDDY" : "HOME",
                       st_name,
@@ -2977,16 +3465,141 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
         return;
     }
 
-    // TPMS toggle: TPMS1 (enable) TPMS0 (disable)
+    // TPMS commands: TPMS1/0, TPMSD (discover), TPMSF,MAC (front), TPMSR,MAC (rear), TPMSI (info)
     if (len >= 4 && buf[0] == 'T' && buf[1] == 'P' && buf[2] == 'M' && buf[3] == 'S') {
+        if (len >= 5 && buf[4] == 'D') {
+            // TPMSD -- start discovery scan (30 seconds, logs all TPMS devices)
+            tpms_discovering = true;
+            tpms_last_scan_ms = 0;  // trigger immediate scan
+            Serial.println("[TPMS] Discovery mode ON -- scanning for 30 seconds...");
+            Serial.println("       All TPMS sensors in range will be logged with MAC addresses.");
+            Serial.println("       Then use TPMSF,MAC and TPMSR,MAC to assign front/rear.");
+            return;
+        }
+        if (len >= 6 && buf[4] == 'F' && buf[5] == ',') {
+            // TPMSF,AA:BB:CC:DD:EE:FF -- set front sensor MAC
+            strncpy(tpms_front_mac, &buf[6], sizeof(tpms_front_mac) - 1);
+            tpms_front_mac[sizeof(tpms_front_mac) - 1] = '\0';
+            nrg_prefs.putString("tpms_f_mac", tpms_front_mac);
+            Serial.printf("[TPMS] Front sensor MAC: %s\n", tpms_front_mac);
+            return;
+        }
+        if (len >= 6 && buf[4] == 'R' && buf[5] == ',') {
+            // TPMSR,AA:BB:CC:DD:EE:FF -- set rear sensor MAC
+            strncpy(tpms_rear_mac, &buf[6], sizeof(tpms_rear_mac) - 1);
+            tpms_rear_mac[sizeof(tpms_rear_mac) - 1] = '\0';
+            nrg_prefs.putString("tpms_r_mac", tpms_rear_mac);
+            Serial.printf("[TPMS] Rear sensor MAC: %s\n", tpms_rear_mac);
+            return;
+        }
+        if (len >= 5 && buf[4] == 'I') {
+            // TPMSI -- show TPMS info
+            Serial.println();
+            Serial.println("-------- TPMS Info --------");
+            Serial.printf("  Enabled:    %s\n", tpms_enabled ? "YES" : "NO");
+            Serial.printf("  Front MAC:  %s\n", tpms_front_mac[0] ? tpms_front_mac : "(not set)");
+            if (tpms_front_valid)
+                Serial.printf("  Front:      %.1f PSI  %.0fF  batt=%.1f\n",
+                              tpms_front_psi, tpms_front_temp_f, tpms_front_battery);
+            Serial.printf("  Rear MAC:   %s\n", tpms_rear_mac[0] ? tpms_rear_mac : "(not set)");
+            if (tpms_rear_valid)
+                Serial.printf("  Rear:       %.1f PSI  %.0fF  batt=%.1f\n",
+                              tpms_rear_psi, tpms_rear_temp_f, tpms_rear_battery);
+            Serial.printf("  Alerts:     LOW<%.0f  CRIT<%.0f  HIGH>%.0f PSI\n",
+                          tpms_alert_low_psi, tpms_alert_crit_psi, tpms_alert_high_psi);
+            Serial.printf("  Temp:       HIGH>%.0fF  CRIT>%.0fF\n",
+                          tpms_alert_high_temp_f, tpms_alert_crit_temp_f);
+            Serial.printf("  Repeat:     every %lu min\n",
+                          (unsigned long)(TPMS_ALERT_REPEAT_MS / 60000));
+            if (tpms_front_interval_s > 0.1f)
+                Serial.printf("  Front rate: every %.1fs\n", tpms_front_interval_s);
+            if (tpms_rear_interval_s > 0.1f)
+                Serial.printf("  Rear rate:  every %.1fs\n", tpms_rear_interval_s);
+            Serial.printf("  Debug:      %s\n", tpms_debug_interval ? "ON" : "OFF");
+            Serial.printf("  Discover:   %s\n", tpms_discovering ? "ACTIVE" : "OFF");
+            Serial.println("---------------------------");
+            Serial.println();
+            return;
+        }
+        if (len >= 5 && buf[4] == 'X') {
+            // TPMSX -- toggle broadcast interval debug (prints every rx with timing)
+            tpms_debug_interval = !tpms_debug_interval;
+            tpms_front_interval_s = 0;
+            tpms_rear_interval_s  = 0;
+            tpms_front_last_rx_ms = 0;
+            tpms_rear_last_rx_ms  = 0;
+            Serial.printf("[TPMS] Broadcast debug %s -- monitoring rx intervals\n",
+                          tpms_debug_interval ? "ON" : "OFF");
+            return;
+        }
+        if (len >= 6 && buf[4] == 'A' && buf[5] == ',') {
+            // TPMSA,low,crit,high -- set pressure alert thresholds (PSI)
+            // Example: TPMSA,30,20,48
+            float vals[3] = {0};
+            int vi = 0;
+            const char *p = &buf[6];
+            vals[0] = atof(p);
+            const char *c1 = strchr(p, ',');
+            if (c1) { vals[1] = atof(c1 + 1); vi = 1;
+                const char *c2 = strchr(c1 + 1, ',');
+                if (c2) { vals[2] = atof(c2 + 1); vi = 2; }
+            }
+            if (vi >= 2) {
+                tpms_alert_low_psi  = vals[0];
+                tpms_alert_crit_psi = vals[1];
+                tpms_alert_high_psi = vals[2];
+                nrg_prefs.putFloat("tpms_low", tpms_alert_low_psi);
+                nrg_prefs.putFloat("tpms_crit", tpms_alert_crit_psi);
+                nrg_prefs.putFloat("tpms_high", tpms_alert_high_psi);
+                Serial.printf("[TPMS] Alerts: LOW<%.0f  CRIT<%.0f  HIGH>%.0f PSI\n",
+                              tpms_alert_low_psi, tpms_alert_crit_psi, tpms_alert_high_psi);
+            } else {
+                Serial.println("[TPMS] Usage: TPMSA,low,crit,high (e.g. TPMSA,30,20,48)");
+            }
+            return;
+        }
+        if (len >= 6 && buf[4] == 'T' && buf[5] == ',') {
+            // TPMST,high_f,crit_f -- set temperature alert thresholds (F)
+            // Example: TPMST,158,185
+            float high_f = atof(&buf[6]);
+            const char *c1 = strchr(&buf[6], ',');
+            if (c1) {
+                float crit_f = atof(c1 + 1);
+                tpms_alert_high_temp_f = high_f;
+                tpms_alert_crit_temp_f = crit_f;
+                nrg_prefs.putFloat("tpms_ht", tpms_alert_high_temp_f);
+                nrg_prefs.putFloat("tpms_ct", tpms_alert_crit_temp_f);
+                Serial.printf("[TPMS] Temp alerts: HIGH>%.0fF  CRIT>%.0fF\n",
+                              tpms_alert_high_temp_f, tpms_alert_crit_temp_f);
+            } else {
+                Serial.println("[TPMS] Usage: TPMST,high_f,crit_f (e.g. TPMST,158,185)");
+            }
+            return;
+        }
+        // TPMS1 / TPMS0 -- enable/disable
         if (len >= 5) {
             tpms_enabled = (buf[4] == '1');
         } else {
             tpms_enabled = !tpms_enabled;
         }
+        nrg_prefs.putBool("tpms_on", tpms_enabled);
         Serial.printf("[TPMS] %s\n", tpms_enabled ? "ENABLED" : "DISABLED");
-        if (tpms_enabled)
-            Serial.println("       Listening for TPMS data from VESC module on CAN");
+        if (tpms_enabled) {
+            Serial.println("       Scanning BLE for TPMS sensors");
+            if (tpms_front_mac[0] == '\0' && tpms_rear_mac[0] == '\0')
+                Serial.println("       WARNING: No sensor MACs configured. Run TPMSD to discover.");
+        }
+        return;
+    }
+
+    // Schedule target time: T0800 (set schedule complete-by time to 08:00)
+    if (buf[0] == 'T' && len == 5 && buf[1] >= '0' && buf[1] <= '2') {
+        schedule_target_hour = (buf[1] - '0') * 10 + (buf[2] - '0');
+        schedule_target_min  = (buf[3] - '0') * 10 + (buf[4] - '0');
+        if (schedule_target_hour > 23) schedule_target_hour = 23;
+        if (schedule_target_min > 59)  schedule_target_min = 59;
+        Serial.printf("[SCHEDULE] Target time set to %02d:%02d\n",
+                      schedule_target_hour, schedule_target_min);
         return;
     }
 
@@ -3063,6 +3676,14 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
                           gps_source == GPS_SOURCE_PHONE ? "PHONE" : "BOTH",
                           gps_source == GPS_SOURCE_ONBOARD ? 'A' :
                           gps_source == GPS_SOURCE_PHONE ? 'P' : 'B');
+            Serial.printf("  WiFi SSID:    %s  (restore: WS,%s)\n",
+                          wifi_sta_ssid[0] ? wifi_sta_ssid : "(none)",
+                          wifi_sta_ssid[0] ? wifi_sta_ssid : "YourSSID");
+            Serial.printf("  WiFi pass:    %s\n", wifi_sta_pass[0] ? "****" : "(none)");
+            Serial.printf("  MQTT host:    %s  (restore: WH,%s)\n",
+                          mqtt_host[0] ? mqtt_host : "(none)",
+                          mqtt_host[0] ? mqtt_host : "192.168.1.x");
+            Serial.printf("  MQTT port:    %u  (restore: WM,%u)\n", mqtt_port, mqtt_port);
             Serial.println("=====================================");
             Serial.println();
             return;
@@ -3105,6 +3726,174 @@ static void cmd_execute_multi(const char *buf, uint8_t len) {
         }
     }
 
+    // Direct value set commands: SV, SA, SM, SR, SP, SO
+    if (buf[0] == 'S' && len >= 2) {
+        if (buf[1] == 'V' && len >= 3) {
+            // SV,84.0 -- set exact voltage
+            const char *comma = strchr(&buf[2], ',');
+            float v = atof(comma ? comma + 1 : &buf[2]);
+            uint16_t dv = (uint16_t)(v * 10.0f);
+            if (dv > CHARGER_VOLTAGE_MAX_DV) dv = CHARGER_VOLTAGE_MAX_DV;
+            if (dv < CHARGER_VOLTAGE_MIN_DV) dv = CHARGER_VOLTAGE_MIN_DV;
+            cmd_voltage_dv = dv;
+            cmd_send_now();
+            Serial.printf("[CMD] Voltage set to %.1fV\n", cmd_voltage_dv * 0.1f);
+            return;
+        }
+        if (buf[1] == 'A' && len >= 3) {
+            // SA,12.0 -- set exact current
+            const char *comma = strchr(&buf[2], ',');
+            float a = atof(comma ? comma + 1 : &buf[2]);
+            uint16_t da = (uint16_t)(a * 10.0f);
+            if (da > CHARGER_CURRENT_MAX_DA) da = CHARGER_CURRENT_MAX_DA;
+            cmd_current_da = da;
+            cmd_send_now();
+            Serial.printf("[CMD] Current set to %.1fA\n", cmd_current_da * 0.1f);
+            return;
+        }
+        if (buf[1] == 'M' && len >= 3) {
+            // SM,84.0,12.0 -- set both voltage and current atomically
+            const char *comma1 = strchr(&buf[2], ',');
+            if (comma1) {
+                float v = atof(comma1 + 1);
+                const char *comma2 = strchr(comma1 + 1, ',');
+                if (comma2) {
+                    float a = atof(comma2 + 1);
+                    uint16_t dv = (uint16_t)(v * 10.0f);
+                    uint16_t da = (uint16_t)(a * 10.0f);
+                    if (dv > CHARGER_VOLTAGE_MAX_DV) dv = CHARGER_VOLTAGE_MAX_DV;
+                    if (dv < CHARGER_VOLTAGE_MIN_DV) dv = CHARGER_VOLTAGE_MIN_DV;
+                    if (da > CHARGER_CURRENT_MAX_DA) da = CHARGER_CURRENT_MAX_DA;
+                    cmd_voltage_dv = dv;
+                    cmd_current_da = da;
+                    cmd_send_now();
+                    Serial.printf("[CMD] Set %.1fV / %.1fA\n",
+                                  cmd_voltage_dv * 0.1f, cmd_current_da * 0.1f);
+                }
+            }
+            return;
+        }
+        if (buf[1] == 'R') {
+            // SR -- request full status dump (for app sync on connect)
+            cmd_print_status();
+            return;
+        }
+        if (buf[1] == 'P' && len >= 3) {
+            // SP,3 -- set profile by number (1-6)
+            const char *comma = strchr(&buf[2], ',');
+            int pn = atoi(comma ? comma + 1 : &buf[2]);
+            if (pn >= 1 && pn <= 6) {
+                cmd_profile = (ChargeProfile_t)(pn - 1);  // MANUAL=0, STORAGE=1, etc.
+                uint16_t sdv = profile_stop_voltage_dv();
+                if (sdv > 0)
+                    Serial.printf("[PROFILE] %s -- auto-stop at %.1fV\n",
+                                  profile_name(cmd_profile), sdv * 0.1f);
+                else
+                    Serial.printf("[PROFILE] %s -- no auto-stop\n", profile_name(cmd_profile));
+            } else {
+                Serial.println("[CMD] SP: profile 1-6 (1=Manual,2=Storage,3=80%,4=85%,5=90%,6=100%)");
+            }
+            return;
+        }
+        if (buf[1] == 'O' && len >= 3) {
+            // SO,A -- set outlet by letter (same as OA-OF/OG/OU)
+            const char *comma = strchr(&buf[2], ',');
+            // Reuse outlet handler by constructing an O-command
+            char obuf[CMD_BUF_SIZE];
+            obuf[0] = 'O';
+            uint8_t olen = 1;
+            // Copy everything after SO or SO,
+            const char *src = comma ? comma + 1 : &buf[2];
+            while (*src && olen < CMD_BUF_SIZE - 1) obuf[olen++] = *src++;
+            obuf[olen] = '\0';
+            cmd_execute_multi(obuf, olen);
+            return;
+        }
+        // Clock sync: S1430 (4 digits after S)
+        if (len == 5 && buf[1] >= '0' && buf[1] <= '2') {
+            time_hour   = (buf[1] - '0') * 10 + (buf[2] - '0');
+            time_minute = (buf[3] - '0') * 10 + (buf[4] - '0');
+            if (time_hour > 23) time_hour = 23;
+            if (time_minute > 59) time_minute = 59;
+            time_valid = true;
+            Serial.printf("[TIME] Set to %02d:%02d\n", time_hour, time_minute);
+            return;
+        }
+    }
+
+    // WiFi credential commands: WS, WP, WH, WM, WI
+    if (buf[0] == 'W' && len >= 2) {
+        if (buf[1] == 'S' && len >= 3) {
+            // WS,MySSID -- set home WiFi SSID
+            const char *comma = strchr(&buf[2], ',');
+            const char *val = comma ? comma + 1 : &buf[2];
+            strncpy(wifi_sta_ssid, val, sizeof(wifi_sta_ssid) - 1);
+            wifi_sta_ssid[sizeof(wifi_sta_ssid) - 1] = '\0';
+            nrg_prefs.putString("wifi_ssid", wifi_sta_ssid);
+            Serial.printf("[WIFI] SSID set: %s\n", wifi_sta_ssid);
+            return;
+        }
+        if (buf[1] == 'P' && len >= 3) {
+            // WP,MyPassword -- set home WiFi password
+            const char *comma = strchr(&buf[2], ',');
+            const char *val = comma ? comma + 1 : &buf[2];
+            strncpy(wifi_sta_pass, val, sizeof(wifi_sta_pass) - 1);
+            wifi_sta_pass[sizeof(wifi_sta_pass) - 1] = '\0';
+            nrg_prefs.putString("wifi_pass", wifi_sta_pass);
+            Serial.printf("[WIFI] Password set (%u chars)\n", (unsigned)strlen(wifi_sta_pass));
+            return;
+        }
+        if (buf[1] == 'H' && len >= 3) {
+            // WH,192.168.1.100 -- set MQTT broker host
+            const char *comma = strchr(&buf[2], ',');
+            const char *val = comma ? comma + 1 : &buf[2];
+            strncpy(mqtt_host, val, sizeof(mqtt_host) - 1);
+            mqtt_host[sizeof(mqtt_host) - 1] = '\0';
+            nrg_prefs.putString("mqtt_host", mqtt_host);
+            Serial.printf("[MQTT] Broker set: %s\n", mqtt_host);
+            return;
+        }
+        if (buf[1] == 'M' && len >= 3) {
+            // WM,1883 -- set MQTT port
+            const char *comma = strchr(&buf[2], ',');
+            mqtt_port = (uint16_t)atoi(comma ? comma + 1 : &buf[2]);
+            nrg_prefs.putUShort("mqtt_port", mqtt_port);
+            Serial.printf("[MQTT] Port set: %u\n", mqtt_port);
+            return;
+        }
+        if (buf[1] == 'I') {
+            // WI -- show WiFi/MQTT info
+            Serial.println();
+            Serial.println("-------- WiFi / MQTT Info --------");
+            Serial.printf("  SSID:      %s\n", wifi_sta_ssid[0] ? wifi_sta_ssid : "(not set)");
+            Serial.printf("  Password:  %s\n", wifi_sta_pass[0] ? "****" : "(not set)");
+            Serial.printf("  STA state: %s\n", wifi_sta_connected ? "CONNECTED" : "DISCONNECTED");
+            if (wifi_sta_connected)
+                Serial.printf("  STA IP:    %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("  MQTT host: %s\n", mqtt_host[0] ? mqtt_host : "(not set)");
+            Serial.printf("  MQTT port: %u\n", mqtt_port);
+            Serial.printf("  MQTT:      %s\n", mqtt_client.connected() ? "CONNECTED" : "DISCONNECTED");
+            Serial.printf("  AP SSID:   %s\n", WIFI_AP_SSID);
+            Serial.printf("  AP IP:     %s\n", WiFi.softAPIP().toString().c_str());
+            Serial.println("----------------------------------");
+            Serial.println();
+            return;
+        }
+        if (buf[1] == 'C') {
+            // WC -- force WiFi STA + MQTT connect now
+            wifi_sta_connect();
+            return;
+        }
+        if (buf[1] == 'D') {
+            // WD -- disconnect WiFi STA
+            WiFi.disconnect(true);
+            wifi_sta_connected = false;
+            mqtt_client.disconnect();
+            Serial.println("[WIFI] STA disconnected");
+            return;
+        }
+    }
+
     Serial.printf("[CMD] Unknown multi-char: %s\n", buf);
 }
 
@@ -3140,10 +3929,12 @@ static void cmd_process_char(char c) {
         }
 
         // Check if this char starts a multi-char command
-        // O = outlet presets, T = thermal/sensor/cal (TZ, TS, TC)
+        // O = outlet presets, T = thermal/sensor/cal (TZ, TS, TC, TPMS)
+        // S = direct set (SV, SA, SM, SR, SP, SO) or clock sync (S1430)
+        // W = WiFi credential commands (WS, WP, WH, WM, WI)
         // Note: single 't' for schedule toggle is handled in the switch below
-        // Multi-char T commands require a second char (Z, S, or C) before Enter
-        if (c == 'O' || c == 'N' || c == 'G' || c == 'P') {
+        // Note: single 's' (lowercase stop) handled in switch, uppercase 'S' buffers
+        if (c == 'O' || c == 'N' || c == 'G' || c == 'P' || c == 'S' || c == 'W') {
             cmd_buf_active = true;
             cmd_buf_len = 0;
             cmd_buf[cmd_buf_len++] = c;
@@ -3510,11 +4301,16 @@ static String wifi_build_status_json(void) {
     if (tpms_enabled) {
         json += ",\"tpms_front_psi\":" + String(tpms_front_psi, 1);
         json += ",\"tpms_front_temp_f\":" + String(tpms_front_temp_f, 0);
+        json += ",\"tpms_front_batt\":" + String(tpms_front_battery, 1);
         json += ",\"tpms_front_valid\":" + String(tpms_front_valid ? "true" : "false");
         json += ",\"tpms_rear_psi\":" + String(tpms_rear_psi, 1);
         json += ",\"tpms_rear_temp_f\":" + String(tpms_rear_temp_f, 0);
+        json += ",\"tpms_rear_batt\":" + String(tpms_rear_battery, 1);
         json += ",\"tpms_rear_valid\":" + String(tpms_rear_valid ? "true" : "false");
     }
+    json += ",\"wifi_sta\":" + String(wifi_sta_connected ? "true" : "false");
+    json += ",\"mqtt\":" + String(mqtt_client.connected() ? "true" : "false");
+    json += ",\"fw\":\"" + String(FW_VERSION) + "\"";
     json += "}";
     return json;
 }
@@ -3540,7 +4336,12 @@ static void wifi_handle_root(void) {
     wifi_server.send(200, "text/plain",
         "TC_Charger WiFi API\n"
         "GET  /status  - JSON telemetry\n"
-        "GET  /cmd?c=X - Send command (r,s,e,w,+,-,v,V,b,n,0,p)\n");
+        "GET  /cmd?c=X - Send command\n"
+        "  Single: r,s,e,w,+,-,v,V,b,n,m,t,1-6,0,p,?\n"
+        "  Direct: SV,84.0  SA,12.0  SM,84.0,12.0  SR  SP,3  SO,A\n"
+        "  Outlet: OA-OF  OG24  OU110,20\n"
+        "  WiFi:   WS,SSID  WP,PASS  WH,IP  WM,1883  WI  WC  WD\n"
+        "GET  /events  - Server-Sent Events stream\n");
 }
 
 static void wifi_handle_status(void) {
@@ -3581,8 +4382,9 @@ static void wifi_handle_cmd(void) {
                 return;
             }
 
-            // Outlet, ThermalZone, TempSensor, TempCal
+            // Outlet, ThermalZone, TempSensor, TempCal, DirectSet, WiFi creds
             if (first == 'O' || first == 'N' || first == 'G' || first == 'P' ||
+                first == 'S' || first == 'W' ||
                 (first == 'T' && cmd.length() >= 3 &&
                  (cmd.charAt(1) == 'Z' || cmd.charAt(1) == 'S' || cmd.charAt(1) == 'C'))) {
                 char buf[CMD_BUF_SIZE];
@@ -3607,6 +4409,14 @@ static void wifi_handle_cmd(void) {
 }
 
 static void wifi_init(void) {
+    // Set WiFi mode upfront: AP+STA if home credentials exist, AP-only otherwise
+    if (wifi_sta_ssid[0] != '\0') {
+        WiFi.mode(WIFI_AP_STA);
+    } else {
+        WiFi.mode(WIFI_AP);
+    }
+
+    // Start AP (always available for direct connection)
     WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
     wifi_server.on("/", wifi_handle_root);
     wifi_server.on("/status", wifi_handle_status);
@@ -3617,10 +4427,168 @@ static void wifi_init(void) {
     Serial.printf("[WIFI] AP started: %s / %s  http://%s\n",
                   WIFI_AP_SSID, WIFI_AP_PASS,
                   WiFi.softAPIP().toString().c_str());
+
+    // If home WiFi credentials are stored, start STA connection
+    if (wifi_sta_ssid[0] != '\0') {
+        Serial.printf("[WIFI] Connecting to '%s'...\n", wifi_sta_ssid);
+        WiFi.begin(wifi_sta_ssid, wifi_sta_pass);
+        wifi_sta_retry_ms = millis();
+    }
 }
 
 static void wifi_update(void) {
     if (wifi_active) wifi_server.handleClient();
+}
+
+// =============================================================================
+//  WIFI STATION MODE + MQTT (Home Assistant)
+// =============================================================================
+// Connects to home WiFi in STA mode (concurrent with AP mode) and publishes
+// charger telemetry to an MQTT broker for Home Assistant auto-discovery.
+// Credentials stored in NVS, configurable via serial (WS/WP/WH/WM), BLE, or WiFi API.
+
+static void wifi_sta_connect(void) {
+    if (wifi_sta_ssid[0] == '\0') {
+        Serial.println("[WIFI] No SSID configured. Use WS,YourSSID then WP,YourPassword");
+        return;
+    }
+    Serial.printf("[WIFI] Connecting to '%s'...\n", wifi_sta_ssid);
+    // Switch to AP+STA dual mode (preserves running AP)
+    if (WiFi.getMode() != WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);  // re-init AP after mode change
+    }
+    WiFi.begin(wifi_sta_ssid, wifi_sta_pass);
+    wifi_sta_retry_ms = millis();
+}
+
+static void mqtt_callback(char *topic, byte *payload, unsigned int length) {
+    // Commands from Home Assistant -> charger
+    char buf[CMD_BUF_SIZE];
+    unsigned int blen = length;
+    if (blen > CMD_BUF_SIZE - 1) blen = CMD_BUF_SIZE - 1;
+    memcpy(buf, payload, blen);
+    buf[blen] = '\0';
+
+    Serial.printf("[MQTT] cmd: %s\n", buf);
+
+    // Process as multi-char or single-char command
+    if (blen >= 2) {
+        cmd_execute_multi(buf, (uint8_t)blen);
+    } else if (blen == 1) {
+        cmd_process_char(buf[0]);
+    }
+}
+
+static void mqtt_send_discovery(void) {
+    // Send Home Assistant MQTT auto-discovery config for key entities
+    // Each entity: topic homeassistant/sensor/scooter_charger/{id}/config
+    struct {
+        const char *id;
+        const char *name;
+        const char *unit;
+        const char *dev_class;
+        const char *val_tpl;
+    } entities[] = {
+        {"voltage",     "Charger Voltage",    "V",    "voltage",      "{{ value_json.smooth_voltage }}"},
+        {"current",     "Charger Current",    "A",    "current",      "{{ value_json.smooth_current }}"},
+        {"power",       "Charger Power",      "W",    "power",        "{{ value_json.power_w }}"},
+        {"session_wh",  "Session Energy",     "Wh",   "energy",       "{{ value_json.session_wh }}"},
+        {"lifetime_wh", "Lifetime Energy",    "Wh",   "energy",       "{{ value_json.lifetime_wh }}"},
+        {"batt_temp",   "Battery Temp",       "F",    "temperature",  "{{ value_json.batt_temp_f }}"},
+        {"cost_session","Session Cost",       "$",    "monetary",     "{{ value_json.cost_session }}"},
+        {"state",       "Charger State",      "",     "",             "{{ value_json.state }}"},
+    };
+
+    for (unsigned i = 0; i < sizeof(entities)/sizeof(entities[0]); i++) {
+        String topic = String(MQTT_TOPIC_DISCOVERY) + "/" + entities[i].id + "/config";
+        String payload = "{";
+        payload += "\"name\":\"" + String(entities[i].name) + "\",";
+        payload += "\"stat_t\":\"" + String(MQTT_TOPIC_STATE) + "\",";
+        payload += "\"val_tpl\":\"" + String(entities[i].val_tpl) + "\",";
+        payload += "\"uniq_id\":\"scooter_charger_" + String(entities[i].id) + "\",";
+        if (entities[i].unit[0])
+            payload += "\"unit_of_meas\":\"" + String(entities[i].unit) + "\",";
+        if (entities[i].dev_class[0])
+            payload += "\"dev_cla\":\"" + String(entities[i].dev_class) + "\",";
+        payload += "\"dev\":{";
+        payload += "\"ids\":[\"scooter_charger_esp32\"],";
+        payload += "\"name\":\"Scooter Charger\",";
+        payload += "\"mf\":\"TC_Charger\",";
+        payload += "\"mdl\":\"HK-LF-115-58 6.6kW\"";
+        payload += "}}";
+
+        mqtt_client.publish(topic.c_str(), payload.c_str(), true);  // retained
+    }
+    Serial.println("[MQTT] Home Assistant auto-discovery sent");
+}
+
+static void mqtt_publish_state(void) {
+    // Reuse the same JSON builder as the WiFi /status endpoint
+    String json = wifi_build_status_json();
+    mqtt_client.publish(MQTT_TOPIC_STATE, json.c_str());
+}
+
+static void wifi_sta_update(void) {
+    uint32_t now = millis();
+
+    // Skip if no credentials configured
+    if (wifi_sta_ssid[0] == '\0') return;
+
+    // Check STA connection state
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wifi_sta_connected) {
+            wifi_sta_connected = true;
+            Serial.printf("[WIFI] Connected to '%s' -- IP: %s\n",
+                          wifi_sta_ssid, WiFi.localIP().toString().c_str());
+
+            // Set up MQTT if broker is configured
+            if (mqtt_host[0] != '\0') {
+                mqtt_client.setServer(mqtt_host, mqtt_port);
+                mqtt_client.setCallback(mqtt_callback);
+                mqtt_client.setBufferSize(512);  // HA discovery payloads can be large
+            }
+        }
+
+        // MQTT connection management
+        if (mqtt_host[0] != '\0') {
+            if (!mqtt_client.connected()) {
+                if ((now - wifi_sta_retry_ms) >= WIFI_STA_RETRY_MS) {
+                    wifi_sta_retry_ms = now;
+                    Serial.printf("[MQTT] Connecting to %s:%u...\n", mqtt_host, mqtt_port);
+                    if (mqtt_client.connect(MQTT_CLIENT_ID)) {
+                        Serial.println("[MQTT] Connected");
+                        mqtt_client.subscribe(MQTT_TOPIC_CMD);
+                        if (!mqtt_discovery_sent) {
+                            mqtt_send_discovery();
+                            mqtt_discovery_sent = true;
+                        }
+                    } else {
+                        Serial.printf("[MQTT] Failed, rc=%d\n", mqtt_client.state());
+                    }
+                }
+            } else {
+                mqtt_client.loop();
+
+                // Publish telemetry periodically
+                if ((now - mqtt_last_publish_ms) >= MQTT_PUBLISH_MS) {
+                    mqtt_last_publish_ms = now;
+                    mqtt_publish_state();
+                }
+            }
+        }
+    } else {
+        if (wifi_sta_connected) {
+            wifi_sta_connected = false;
+            mqtt_discovery_sent = false;
+            Serial.println("[WIFI] STA disconnected");
+        }
+        // Auto-retry connection
+        if ((now - wifi_sta_retry_ms) >= WIFI_STA_RETRY_MS) {
+            wifi_sta_retry_ms = now;
+            WiFi.begin(wifi_sta_ssid, wifi_sta_pass);
+        }
+    }
 }
 
 // =============================================================================
@@ -3699,7 +4667,7 @@ void setup() {
     Serial.begin(115200);
     Serial.println();
     Serial.println("========================================");
-    Serial.println("  TC_Charger Main Brain");
+    Serial.println("  TC_Charger Main Brain  v" FW_VERSION);
     Serial.println("  HK-LF-115-58 6.6kW OBC Controller");
     Serial.println("========================================");
     Serial.println();
@@ -3745,11 +4713,7 @@ void setup() {
     gps_driver_init();
     esp_task_wdt_reset();
 
-    // WiFi AP for fallback control
-    wifi_init();
-    esp_task_wdt_reset();
-
-    // Load settings from NVS flash
+    // Load settings from NVS flash (must be before wifi_init for STA credentials)
     nrg_prefs.begin("charger_nrg", false);
     nrg_lifetime_wh = nrg_prefs.getFloat("lifetime_wh", 0.0f);
     nrg_lifetime_ah = nrg_prefs.getFloat("lifetime_ah", 0.0f);
@@ -3780,6 +4744,31 @@ void setup() {
     cost_lifetime = nrg_prefs.getFloat("cost_life", 0.0f);
     cost_free_lifetime = nrg_prefs.getFloat("cost_free", 0.0f);
 
+    // Load WiFi STA + MQTT credentials
+    {
+        String s = nrg_prefs.getString("wifi_ssid", "");
+        s.toCharArray(wifi_sta_ssid, sizeof(wifi_sta_ssid));
+        s = nrg_prefs.getString("wifi_pass", "");
+        s.toCharArray(wifi_sta_pass, sizeof(wifi_sta_pass));
+        s = nrg_prefs.getString("mqtt_host", "");
+        s.toCharArray(mqtt_host, sizeof(mqtt_host));
+        mqtt_port = nrg_prefs.getUShort("mqtt_port", 1883);
+    }
+
+    // Load TPMS settings
+    tpms_enabled = nrg_prefs.getBool("tpms_on", false);
+    {
+        String s = nrg_prefs.getString("tpms_f_mac", "");
+        s.toCharArray(tpms_front_mac, sizeof(tpms_front_mac));
+        s = nrg_prefs.getString("tpms_r_mac", "");
+        s.toCharArray(tpms_rear_mac, sizeof(tpms_rear_mac));
+    }
+    tpms_alert_low_psi     = nrg_prefs.getFloat("tpms_low",  30.0f);
+    tpms_alert_crit_psi    = nrg_prefs.getFloat("tpms_crit", 20.0f);
+    tpms_alert_high_psi    = nrg_prefs.getFloat("tpms_high", 48.0f);
+    tpms_alert_high_temp_f = nrg_prefs.getFloat("tpms_ht",   158.0f);
+    tpms_alert_crit_temp_f = nrg_prefs.getFloat("tpms_ct",   185.0f);
+
     Serial.printf("[NVS] Lifetime: %.1fWh / %.1fAh  Efficiency: %.1f Wh/mi\n",
                   nrg_lifetime_wh, nrg_lifetime_ah, range_wh_per_mile);
     Serial.printf("[NVS] Outlet: %s (max %uW)%s\n",
@@ -3787,6 +4776,19 @@ void setup() {
                   test_dev_mode ? " [DEV MODE]" : "");
     Serial.printf("[NVS] Thermal zones: NORMAL<%.0fF CAUTION<%.0fF DANGER<%.0fF\n",
                   tz_normal_max_f, tz_caution_max_f, tz_danger_max_f);
+    if (wifi_sta_ssid[0])
+        Serial.printf("[NVS] Home WiFi: %s  MQTT: %s:%u\n",
+                      wifi_sta_ssid,
+                      mqtt_host[0] ? mqtt_host : "(none)",
+                      mqtt_port);
+    if (tpms_enabled)
+        Serial.printf("[NVS] TPMS: ON  Front=%s  Rear=%s\n",
+                      tpms_front_mac[0] ? tpms_front_mac : "(none)",
+                      tpms_rear_mac[0] ? tpms_rear_mac : "(none)");
+
+    // WiFi AP (+ STA if credentials exist) -- after NVS loaded
+    wifi_init();
+    esp_task_wdt_reset();
 
     // Start with charger disabled
     can_send_disable();
@@ -3808,4 +4810,6 @@ void loop() {
     bme280_update();
     gps_driver_update();
     wifi_update();
+    wifi_sta_update();
+    tpms_scan_update();
 }

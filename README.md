@@ -290,15 +290,85 @@ Set each of these in the **Tools** menu. Every setting matters.
 
 Go to **Sketch > Include Library > Manage Libraries** and install:
 
-| Library | Search Term | Author |
-|---|---|---|
-| FastLED | FastLED | Daniel Garcia |
-| U8g2 | U8g2 | oliver |
-| Adafruit AHTX0 | Adafruit AHTX0 | Adafruit |
-| Adafruit BMP280 Library | Adafruit BMP280 | Adafruit |
-| TinyGPSPlus | TinyGPSPlus | Mikal Hart |
+| Library | Search Term | Author | Purpose |
+|---|---|---|---|
+| FastLED | FastLED | Daniel Garcia | WS2812B RGB status LED |
+| U8g2 | U8g2 | oliver | SH1106 OLED display |
+| Adafruit AHTX0 | Adafruit AHTX0 | Adafruit | AHT20 temp/humidity sensor |
+| Adafruit BMP280 Library | Adafruit BMP280 | Adafruit | BMP280 barometric pressure |
+| TinyGPSPlus | TinyGPSPlus | Mikal Hart | GPS NMEA parsing |
+| PubSubClient | PubSubClient | Nick O'Leary | MQTT for Home Assistant |
 
 Accept any dependency prompts (Adafruit BusIO, Adafruit Unified Sensor, etc.)
+
+**Alternatively, run the automated install script (see Step 3b below).**
+
+### Step 3b: Automated Library Install (PowerShell)
+
+Copy and paste this into **Windows PowerShell** to check for and install all
+required libraries automatically. This uses the Arduino CLI bundled with
+Arduino IDE.
+
+```powershell
+# TC_Charger -- Automated Library Installer
+# Run in Windows PowerShell (not Command Prompt)
+
+$cli = "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
+
+if (-not (Test-Path $cli)) {
+    # Try alternate install locations
+    $cli = "$env:LOCALAPPDATA\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
+}
+
+if (-not (Test-Path $cli)) {
+    Write-Host "ERROR: Arduino CLI not found. Install Arduino IDE first." -ForegroundColor Red
+    Write-Host "Download: https://www.arduino.cc/en/software"
+    exit 1
+}
+
+Write-Host "Using Arduino CLI: $cli" -ForegroundColor Cyan
+Write-Host ""
+
+# Required libraries (exact names for arduino-cli)
+$libraries = @(
+    "FastLED",
+    "U8g2",
+    "Adafruit AHTX0",
+    "Adafruit BMP280 Library",
+    "TinyGPSPlus",
+    "PubSubClient"
+)
+
+# Get currently installed libraries
+$installed = & $cli lib list 2>$null
+
+foreach ($lib in $libraries) {
+    if ($installed -match [regex]::Escape($lib)) {
+        Write-Host "[OK]      $lib (already installed)" -ForegroundColor Green
+    } else {
+        Write-Host "[INSTALL] $lib ..." -ForegroundColor Yellow
+        & $cli lib install $lib
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "          $lib installed successfully" -ForegroundColor Green
+        } else {
+            Write-Host "          FAILED to install $lib" -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "All libraries checked. You can now compile the firmware." -ForegroundColor Cyan
+Write-Host ""
+
+# Also check for ESP32 board package
+$boards = & $cli board listall 2>$null
+if ($boards -match "ESP32S3") {
+    Write-Host "[OK]      ESP32 board package installed" -ForegroundColor Green
+} else {
+    Write-Host "[INSTALL] ESP32 board package ..." -ForegroundColor Yellow
+    & $cli core install esp32:esp32
+}
+```
 
 ### Step 4: Upload
 
